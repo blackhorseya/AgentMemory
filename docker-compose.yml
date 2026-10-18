@@ -1,0 +1,116 @@
+# MemoryCore (Rust) + Monitor Panel (TypeScript).
+#
+#   cp .env.example .env && $EDITOR .env
+#   docker compose up -d --build
+#   open http://localhost:${PANEL_PORT:-8125}
+#
+# PostgreSQL + pgvector storage (profile `postgres`, off by default):
+#   POSTGRES_PASSWORD=… AGENT_MEMORY_STORAGE_BACKEND=postgres \
+#     docker compose --profile postgres up -d --build
+services:
+  memory-core:
+    build:
+      context: .
+      dockerfile: docker/core.Dockerfile
+    image: memory-core:local
+    environment:
+      AGENT_MEMORY_API_KEY: ${AGENT_MEMORY_API_KEY:?set AGENT_MEMORY_API_KEY in .env}
+      AGENT_MEMORY_LLM_PROVIDER: ${AGENT_MEMORY_LLM_PROVIDER:-openai}
+      AGENT_MEMORY_LLM_BASE_URL: ${AGENT_MEMORY_LLM_BASE_URL:-https://api.openai.com/v1}
+      AGENT_MEMORY_LLM_API_KEY: ${AGENT_MEMORY_LLM_API_KEY:-}
+      AGENT_MEMORY_LLM_MODEL: ${AGENT_MEMORY_LLM_MODEL:-gpt-4o-mini}
+      # provider=cli: the image bundles `claude` and `agy` (Antigravity).
+      AGENT_MEMORY_LLM_CLI_COMMAND: ${AGENT_MEMORY_LLM_CLI_COMMAND:-}
+      AGENT_MEMORY_LLM_CLI_ARGS: ${AGENT_MEMORY_LLM_CLI_ARGS:-}
+      AGENT_MEMORY_LLM_CLI_PROMPT_MODE: ${AGENT_MEMORY_LLM_CLI_PROMPT_MODE:-stdin}
+      AGENT_MEMORY_LLM_CLI_WORKDIR: /workspace
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      AGENT_MEMORY_EMBEDDING_PROVIDER: ${AGENT_MEMORY_EMBEDDING_PROVIDER:-none}
+      AGENT_MEMORY_EMBEDDING_BASE_URL: ${AGENT_MEMORY_EMBEDDING_BASE_URL:-}
+      AGENT_MEMORY_EMBEDDING_API_KEY: ${AGENT_MEMORY_EMBEDDING_API_KEY:-}
+      AGENT_MEMORY_EMBEDDING_MODEL: ${AGENT_MEMORY_EMBEDDING_MODEL:-}
+      AGENT_MEMORY_EMBEDDING_DIMENSIONS: ${AGENT_MEMORY_EMBEDDING_DIMENSIONS:-0}
+      # Multi-replica coordination: start with `--profile redis` and set
+      # AGENT_MEMORY_COORDINATION_BACKEND=redis.
+      AGENT_MEMORY_COORDINATION_BACKEND: ${AGENT_MEMORY_COORDINATION_BACKEND:-local}
+      AGENT_MEMORY_REDIS_URL: ${AGENT_MEMORY_REDIS_URL:-redis://redis:6379/0}
+      # sqlite (default) or postgres (needs the `postgres` profile).
+      AGENT_MEMORY_STORAGE_BACKEND: ${AGENT_MEMORY_STORAGE_BACKEND:-sqlite}
+      AGENT_MEMORY_POSTGRES_URL: ${AGENT_MEMORY_POSTGRES_URL:-postgres://${POSTGRES_USER:-memory}:${POSTGRES_PASSWORD:-}@postgres:5432/${POSTGRES_DB:-memory}}
+    depends_on:
+      # Each dependency only applies when its profile is enabled.
+      postgres:
+        condition: service_healthy
+        required: false
+      redis:
+        condition: service_healthy
+        required: false
+    # Lets external databases/LLMs on this machine be reached as
+    # host.docker.internal (Linux needs the explicit mapping).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${CORE_PORT:-8420}:8420"
+    volumes:
+      - memory-core-data:/data
+      # Project the CLI runs in (read by the tool as its working directory).
+      - ${PROJECT_DIR:-./workspace}:/workspace
+      # CLI logins survive container rebuilds.
+      - claude-config:/home/memory/.claude
+      - antigravity-config:/home/memory/.gemini
+    restart: unless-stopped
+
+  memory-panel:
+    build:
+      context: ./panel
+    image: memory-panel:local
+    environment:
+      CORE_URL: http://memory-core:8420
+      CORE_API_KEY: ${AGENT_MEMORY_API_KEY}
+      CORE_INSTANCE_ID: ${CORE_INSTANCE_ID:-default}
+    ports:
+      - "${PANEL_PORT:-8125}:8125"
+    depends_on:
+      memory-core:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Shared pipeline state, job queue and locks for several memory-core
+  # replicas. Opt-in: `docker compose --profile redis up -d`.
+  redis:
+    image: redis:8.4.0
+    profiles: [redis]
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  postgres:
+    image: pgvector/pgvector:pg16
+    profiles: ["postgres"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-memory}
+      # Required for this profile: the image refuses to initialise without it.
+      # (`:?` would be checked even when the profile is off, breaking the
+      # default `docker compose up`.)
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      POSTGRES_DB: ${POSTGRES_DB:-memory}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  memory-core-data:
+  redis-data:
+  postgres-data:
+  claude-config:
+  antigravity-config:

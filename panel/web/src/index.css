@@ -1,0 +1,60 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Design tokens as RGB triplets so Tailwind can apply alpha. */
+:root {
+  --bg: 246 247 249;
+  --surface: 255 255 255;
+  --raised: 241 243 246;
+  --line: 222 226 232;
+  --fg: 22 27 34;
+  --muted: 101 109 122;
+  --accent: 37 99 235;
+  --ok: 22 163 74;
+  --warn: 202 138 4;
+  --err: 220 38 38;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: 13 17 23;
+    --surface: 22 27 34;
+    --raised: 30 36 45;
+    --line: 48 54 64;
+    --fg: 230 237 243;
+    --muted: 139 148 158;
+    --accent: 88 166 255;
+    --ok: 63 185 80;
+    --warn: 210 153 34;
+    --err: 248 81 73;
+    color-scheme: dark;
+  }
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    @apply h-full;
+  }
+  body {
+    @apply bg-bg font-sans text-[13px] text-fg antialiased;
+  }
+  ::selection {
+    @apply bg-accent/25;
+  }
+}
+
+@layer components {
+  .input {
+    @apply h-8 rounded border border-line bg-surface px-2 text-[13px] text-fg outline-none placeholder:text-muted focus:border-accent focus:ring-1 focus:ring-accent/40 disabled:opacity-50;
+  }
+  .label {
+    @apply text-xxs font-medium uppercase tracking-wide text-muted;
+  }
+  .mono {
+    @apply font-mono text-[12px];
+  }
+}

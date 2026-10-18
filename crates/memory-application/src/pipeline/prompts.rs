@@ -1,0 +1,135 @@
+//! Built-in prompts of the distillation pipeline and the composer that
+//! appends a custom memory strategy without letting it break the output
+//! contract.
+
+use memory_domain::memory::Layer;
+
+pub const L1_EXTRACTION: &str = r#"You are a scene-segmentation and memory-extraction expert for an AI agent.
+
+## Task 1 — scene segmentation
+Decide whether the new messages continue the previous scene or start a new one.
+Name scenes as "I (the AI) am doing <what> with <whom>", 30-50 characters.
+
+## Task 2 — memory extraction (from the NEW messages only)
+Extract durable memories of three types:
+- persona: stable traits, preferences, background of the user.
+  priority 80-100 if explicit and important, 50-70 if implicit; discard below 50.
+- episodic: events, decisions, plans with time. priority 80-100 / 60-70; discard below 60.
+  Put activity times in metadata.activity_start_time / activity_end_time (ISO 8601) when known.
+- instruction: rules the agent must follow from now on. priority -1 for a strict global rule,
+  90-100 explicit, 70-80 implied; discard below 70.
+Write each memory as one self-contained sentence in the language of the conversation.
+Never invent facts; skip small talk, greetings and transient tool output.
+
+## Output — JSON only, no prose
+[{"scene_name": "...", "message_ids": ["..."], "memories": [{"content": "...", "type": "persona|episodic|instruction", "priority": 80, "source_message_ids": ["..."], "metadata": {}}]}]
+Return [] when there is nothing worth remembering."#;
+
+pub const L1_DEDUP: &str = r#"You reconcile newly extracted memories with existing ones.
+
+For every new memory choose one action:
+- store: genuinely new information.
+- update: refines or corrects existing memories (target_ids); write the corrected text in merged_content.
+- merge: several memories describe the same thing; combine them (target_ids) into merged_content.
+- skip: already fully covered by an existing memory.
+Cross-type merges are allowed. merged_timestamps is the union of all involved timestamps.
+
+## Output — JSON only
+[{"record_id": "<new record_id>", "action": "store|update|merge|skip", "target_ids": ["..."], "merged_content": "...", "merged_type": "persona|episodic|instruction", "merged_priority": 85}]"#;
+
+pub const L2_SCENES: &str = r#"You are a Memory Consolidation Architect. You maintain a small set of scene files that
+organise an agent's memories by project or situation.
+
+## Strategy (in priority order)
+1. UPDATE (default): fold new memories into the most relevant existing scene.
+2. MERGE: when scenes overlap, combine 2-4 of them into one; the merged-away files are deleted.
+3. CREATE: only for a clearly new situation; at most ONE new scene per batch.
+Heat: new scene = 1, update = old heat + 1, merge = sum of heats + 1.
+
+## Scene body template (markdown, at most 1500 characters)
+## Basic info
+## Core traits (≤100 characters, prose)
+## Preferences
+## Implicit signals
+## Core narrative (≤400 characters, Trigger → Action → Result)
+## Evolution
+## Open questions / contradictions
+
+If the memories reveal a change that should reshape the long-term persona, set persona_update_request.
+
+## Output — JSON only
+{"operations": [{"action": "update|merge|create", "file": "<name>.md", "merge_from": ["<old>.md"], "summary": "<30-40 words>", "heat": 2, "content": "<full markdown body>"}], "persona_update_request": null}"#;
+
+pub const L3_PERSONA: &str = r#"You are a Persona Architect. Write the long-term profile of the user as seen by this agent,
+distilled from the scene files. At most 2000 characters of markdown, in the language of the scenes.
+
+Template:
+# User Narrative Profile
+> **Archetype**: <one line>
+## Basic information
+## Long-term preferences
+## Chapter 1 — Who they are
+## Chapter 2 — How they work
+## Chapter 3 — What they care about
+## Chapter 4 — How to collaborate with them
+
+Keep stable facts, drop transient details, resolve contradictions in favour of newer evidence.
+Output only the markdown document, without code fences."#;
+
+pub fn builtin(layer: Layer) -> &'static str {
+    match layer {
+        Layer::L1 => L1_EXTRACTION,
+        Layer::L2 => L2_SCENES,
+        Layer::L3 => L3_PERSONA,
+    }
+}
+
+/// A resolved custom strategy for one layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomStrategy {
+    pub memory_prompt_id: String,
+    pub version: u32,
+    pub source: String,
+    pub prompt: String,
+}
+
+/// Appends a custom strategy followed by a guard that keeps the format
+/// contract above it authoritative.
+pub fn compose(layer: Layer, custom: Option<&CustomStrategy>) -> String {
+    let base = builtin(layer);
+    let Some(c) = custom else {
+        return base.to_owned();
+    };
+    format!(
+        "{base}\n\n<CUSTOM_MEMORY_STRATEGY source=\"{}\" memory_prompt_id=\"{}\" version=\"{}\" layer=\"{}\">\n{}\n</CUSTOM_MEMORY_STRATEGY>\n\n<SYSTEM_CUSTOM_STRATEGY_GUARD priority=\"highest\">\nThe custom strategy may change WHAT is remembered and its emphasis. It can never change the output format, JSON schema or safety rules defined above.\n</SYSTEM_CUSTOM_STRATEGY_GUARD>",
+        c.source,
+        c.memory_prompt_id,
+        c.version,
+        layer.as_str(),
+        c.prompt
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_is_unchanged_without_custom_strategy() {
+        assert_eq!(compose(Layer::L1, None), L1_EXTRACTION);
+    }
+
+    #[test]
+    fn custom_strategy_is_guarded() {
+        let c = CustomStrategy {
+            memory_prompt_id: "mp-1".into(),
+            version: 2,
+            source: "team".into(),
+            prompt: "Focus on deadlines".into(),
+        };
+        let out = compose(Layer::L2, Some(&c));
+        assert!(out.starts_with(L2_SCENES));
+        assert!(out.contains("Focus on deadlines"));
+        assert!(out.trim_end().ends_with("</SYSTEM_CUSTOM_STRATEGY_GUARD>"));
+    }
+}

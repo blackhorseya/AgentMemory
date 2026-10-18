@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/memory-domain",
+    "crates/memory-application",
+    "crates/memory-infrastructure",
+    "crates/memory-gateway",
+    "crates/memory-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.88"
+
+[workspace.dependencies]
+memory-domain = { path = "crates/memory-domain" }
+memory-application = { path = "crates/memory-application" }
+memory-infrastructure = { path = "crates/memory-infrastructure" }
+memory-gateway = { path = "crates/memory-gateway" }
+
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.7"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"
+redis = { version = "1.7", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+sqlite-vec = "=0.1.9"
+# 0.8.x keeps the workspace MSRV (0.9 needs Rust 1.94); no macros, so no
+# live database is needed at compile time.
+sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "chrono", "json"] }
+# 0.4.x is the line built against sqlx >=0.8,<0.10.
+pgvector = { version = "0.4.2", features = ["sqlx"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+hex = "0.4"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "limit"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4"] }
+tempfile = "3"

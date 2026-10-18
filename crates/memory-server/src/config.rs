@@ -1,0 +1,680 @@
+//! Configuration: a `memory-core.yaml` file
+//! with `${VAR}` / `${VAR:-default}` expansion, overridden by `AGENT_MEMORY_*` env.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{bail, Context, Result};
+use serde::Deserialize;
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Config {
+    pub server: ServerConfig,
+    pub data: DataConfig,
+    pub llm: LlmConfig,
+    pub memory: MemoryConfig,
+    pub skill: SkillConfig,
+    pub metadata: MetadataConfig,
+    pub worker: WorkerConfig,
+    pub storage: StorageConfig,
+    pub coordination: CoordinationConfig,
+}
+
+/// Where memory, metadata and skills are persisted.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct StorageConfig {
+    /// `sqlite` (one file per instance) or `postgres` (pgvector).
+    pub backend: String,
+    pub postgres: PostgresConfig,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            backend: "sqlite".into(),
+            postgres: PostgresConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PostgresConfig {
+    pub url: String,
+    pub max_connections: u32,
+}
+
+impl Default for PostgresConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            max_connections: 10,
+        }
+    }
+}
+
+/// Where pipeline timers, the job queue and locks live.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CoordinationConfig {
+    /// `local` (single node) or `redis` (several nodes share work).
+    pub backend: String,
+    pub redis: RedisConfig,
+}
+
+impl Default for CoordinationConfig {
+    fn default() -> Self {
+        Self {
+            backend: "local".into(),
+            redis: RedisConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RedisConfig {
+    pub url: String,
+    pub key_prefix: String,
+    /// How long a job/state lock lives without renewal.
+    pub lock_ttl_ms: u64,
+    /// How long a popped job may go without an ack or lease extension
+    /// before another node redelivers it (the node is presumed dead).
+    pub queue_lease_ms: u64,
+}
+
+impl Default for RedisConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            key_prefix: "agent_memory".into(),
+            lock_ttl_ms: 600_000,
+            queue_lease_ms: 900_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ServerConfig {
+    pub host: String,
+    pub port: u16,
+    pub api_key: Option<String>,
+    pub cors_origins: Vec<String>,
+    pub max_body_bytes: usize,
+    pub max_session_body_bytes: usize,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".into(),
+            port: 8420,
+            api_key: None,
+            cors_origins: Vec::new(),
+            max_body_bytes: 1024 * 1024,
+            max_session_body_bytes: 32 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DataConfig {
+    pub base_dir: String,
+    pub max_open_instances: usize,
+}
+
+impl Default for DataConfig {
+    fn default() -> Self {
+        Self {
+            base_dir: "~/.agent-memory".into(),
+            max_open_instances: 100,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct LlmConfig {
+    /// `openai` (any OpenAI-compatible HTTP API) or `cli` (a local tool).
+    pub provider: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub max_tokens: u32,
+    pub timeout_ms: u64,
+    pub cli: CliLlmConfig,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            provider: "openai".into(),
+            cli: CliLlmConfig::default(),
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: String::new(),
+            model: "gpt-4o".into(),
+            max_tokens: 8192,
+            timeout_ms: 180_000,
+        }
+    }
+}
+
+/// A local command-line tool that answers prompts, run in a project.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CliLlmConfig {
+    pub command: String,
+    pub args: Vec<String>,
+    /// `stdin` (default) or `arg` (substitutes `{prompt}` in `args`).
+    pub prompt_mode: String,
+    /// Project base path used as the tool's working directory.
+    pub working_dir: Option<String>,
+    pub env: std::collections::BTreeMap<String, String>,
+    pub max_concurrency: usize,
+}
+
+impl Default for CliLlmConfig {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            args: Vec::new(),
+            prompt_mode: "stdin".into(),
+            working_dir: None,
+            env: Default::default(),
+            max_concurrency: 2,
+        }
+    }
+}
+
+/// Parses a list from the environment: a JSON array, or whitespace-separated.
+pub fn parse_arg_list(raw: &str) -> Vec<String> {
+    if raw.trim_start().starts_with('[') {
+        if let Ok(list) = serde_json::from_str::<Vec<String>>(raw) {
+            return list;
+        }
+    }
+    raw.split_whitespace().map(str::to_owned).collect()
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct MemoryConfig {
+    pub extraction: ExtractionConfig,
+    pub persona: PersonaConfig,
+    pub pipeline: PipelineConfig,
+    pub recall: RecallConfig,
+    pub embedding: EmbeddingConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ExtractionConfig {
+    pub enabled: bool,
+    pub enable_dedup: bool,
+    pub max_memories_per_session: usize,
+}
+
+impl Default for ExtractionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            enable_dedup: true,
+            max_memories_per_session: 20,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PersonaConfig {
+    pub trigger_every_n: u32,
+    pub max_scenes: usize,
+}
+
+impl Default for PersonaConfig {
+    fn default() -> Self {
+        Self {
+            trigger_every_n: 50,
+            max_scenes: 15,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PipelineConfig {
+    pub every_n_conversations: u32,
+    pub enable_warmup: bool,
+    pub l1_idle_timeout_seconds: u64,
+    pub l2_delay_after_l1_seconds: u64,
+    pub l2_min_interval_seconds: u64,
+    pub l2_max_interval_seconds: u64,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            every_n_conversations: 5,
+            enable_warmup: true,
+            l1_idle_timeout_seconds: 600,
+            l2_delay_after_l1_seconds: 90,
+            l2_min_interval_seconds: 900,
+            l2_max_interval_seconds: 3600,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RecallConfig {
+    pub max_results: usize,
+    pub score_threshold: f64,
+    pub strategy: String,
+    pub timeout_ms: u64,
+    pub max_chars_per_memory: usize,
+    pub max_total_recall_chars: usize,
+}
+
+impl Default for RecallConfig {
+    fn default() -> Self {
+        Self {
+            max_results: 5,
+            score_threshold: 0.3,
+            strategy: "hybrid".into(),
+            timeout_ms: 5000,
+            max_chars_per_memory: 0,
+            max_total_recall_chars: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct EmbeddingConfig {
+    /// `none` (BM25 only) or any OpenAI-compatible provider name.
+    pub provider: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub dimensions: usize,
+    pub timeout_ms: u64,
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            provider: "none".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            dimensions: 0,
+            timeout_ms: 10_000,
+        }
+    }
+}
+
+impl EmbeddingConfig {
+    pub fn is_enabled(&self) -> bool {
+        self.provider != "none"
+            && !self.base_url.is_empty()
+            && !self.api_key.is_empty()
+            && !self.model.is_empty()
+            && self.dimensions > 0
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SkillConfig {
+    pub enabled: bool,
+    pub routing: SkillRoutingConfig,
+    pub extraction: SkillExtractionConfig,
+    pub version_ttl_days: i64,
+    pub max_versions: usize,
+}
+
+impl Default for SkillConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            routing: SkillRoutingConfig::default(),
+            extraction: SkillExtractionConfig::default(),
+            version_ttl_days: 0,
+            max_versions: 100,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SkillRoutingConfig {
+    pub search_top_k: usize,
+}
+
+impl Default for SkillRoutingConfig {
+    fn default() -> Self {
+        Self { search_top_k: 20 }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SkillExtractionConfig {
+    pub enabled: bool,
+    pub archive_bytes: usize,
+    pub tool_call_threshold: u32,
+}
+
+impl Default for SkillExtractionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            archive_bytes: 40 * 1024,
+            tool_call_threshold: 10,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct MetadataConfig {
+    pub max_users_per_instance: usize,
+    pub max_teams_per_instance: usize,
+    pub max_active_keys_per_user: usize,
+}
+
+impl Default for MetadataConfig {
+    fn default() -> Self {
+        Self {
+            max_users_per_instance: 500,
+            max_teams_per_instance: 100,
+            max_active_keys_per_user: 20,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WorkerConfig {
+    pub concurrency: usize,
+    pub max_retries: u32,
+    pub scan_interval_ms: u64,
+}
+
+impl Default for WorkerConfig {
+    fn default() -> Self {
+        Self {
+            concurrency: 8,
+            max_retries: 3,
+            scan_interval_ms: 2000,
+        }
+    }
+}
+
+/// Expands `${VAR}` and `${VAR:-default}` using `lookup`.
+pub fn expand_vars(text: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let Some(end) = rest[start..].find('}') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let expr = &rest[start + 2..start + end];
+        let (name, default) = expr
+            .split_once(":-")
+            .map_or((expr, None), |(n, d)| (n, Some(d)));
+        out.push_str(
+            &lookup(name)
+                .filter(|v| !v.is_empty())
+                .or(default.map(str::to_owned))
+                .unwrap_or_default(),
+        );
+        rest = &rest[start + end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+fn find_config_file() -> Option<PathBuf> {
+    if let Some(path) = env("AGENT_MEMORY_CONFIG") {
+        return Some(PathBuf::from(path));
+    }
+    ["memory-core.yaml", "memory-core.yml"]
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.exists())
+}
+
+pub fn expand_home(path: &str) -> PathBuf {
+    match path.strip_prefix("~/") {
+        Some(rest) => env("HOME")
+            .map(|h| Path::new(&h).join(rest))
+            .unwrap_or_else(|| PathBuf::from(path)),
+        None => PathBuf::from(path),
+    }
+}
+
+impl Config {
+    pub fn load() -> Result<Self> {
+        let mut config = match find_config_file() {
+            Some(path) => {
+                let raw = std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                serde_yaml::from_str(&expand_vars(&raw, env))
+                    .with_context(|| format!("parsing {}", path.display()))?
+            }
+            None => Config::default(),
+        };
+        config.apply_env();
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn apply_env(&mut self) {
+        let set = |target: &mut String, name: &str| {
+            if let Some(v) = env(name) {
+                *target = v;
+            }
+        };
+        set(&mut self.server.host, "AGENT_MEMORY_HOST");
+        if let Some(port) = env("AGENT_MEMORY_PORT").and_then(|p| p.parse().ok()) {
+            self.server.port = port;
+        }
+        if let Some(key) = env("AGENT_MEMORY_API_KEY") {
+            self.server.api_key = Some(key);
+        }
+        if let Some(origins) = env("AGENT_MEMORY_CORS_ORIGINS") {
+            self.server.cors_origins = origins
+                .split(',')
+                .map(|o| o.trim().to_owned())
+                .filter(|o| !o.is_empty())
+                .collect();
+        }
+        set(&mut self.data.base_dir, "AGENT_MEMORY_DATA_DIR");
+        set(&mut self.llm.api_key, "AGENT_MEMORY_LLM_API_KEY");
+        set(&mut self.llm.base_url, "AGENT_MEMORY_LLM_BASE_URL");
+        set(&mut self.llm.model, "AGENT_MEMORY_LLM_MODEL");
+        set(&mut self.llm.provider, "AGENT_MEMORY_LLM_PROVIDER");
+        set(&mut self.storage.backend, "AGENT_MEMORY_STORAGE_BACKEND");
+        set(&mut self.storage.postgres.url, "AGENT_MEMORY_POSTGRES_URL");
+        set(
+            &mut self.coordination.backend,
+            "AGENT_MEMORY_COORDINATION_BACKEND",
+        );
+        set(&mut self.coordination.redis.url, "AGENT_MEMORY_REDIS_URL");
+        set(&mut self.llm.cli.command, "AGENT_MEMORY_LLM_CLI_COMMAND");
+        set(
+            &mut self.llm.cli.prompt_mode,
+            "AGENT_MEMORY_LLM_CLI_PROMPT_MODE",
+        );
+        if let Some(args) = env("AGENT_MEMORY_LLM_CLI_ARGS") {
+            self.llm.cli.args = parse_arg_list(&args);
+        }
+        if let Some(dir) = env("AGENT_MEMORY_LLM_CLI_WORKDIR") {
+            self.llm.cli.working_dir = Some(dir);
+        }
+        let e = &mut self.memory.embedding;
+        set(&mut e.provider, "AGENT_MEMORY_EMBEDDING_PROVIDER");
+        set(&mut e.base_url, "AGENT_MEMORY_EMBEDDING_BASE_URL");
+        set(&mut e.api_key, "AGENT_MEMORY_EMBEDDING_API_KEY");
+        set(&mut e.model, "AGENT_MEMORY_EMBEDDING_MODEL");
+        if let Some(d) = env("AGENT_MEMORY_EMBEDDING_DIMENSIONS").and_then(|d| d.parse().ok()) {
+            e.dimensions = d;
+        }
+        if let Some(enabled) = env("AGENT_MEMORY_SKILL_ENABLED") {
+            self.skill.enabled = matches!(enabled.as_str(), "1" | "true" | "on" | "yes");
+        }
+        if self.server.api_key.as_deref().is_some_and(str::is_empty) {
+            self.server.api_key = None;
+        }
+    }
+
+    /// Exposing the API beyond loopback without a key would leak every
+    /// tenant's memory.
+    fn validate(&self) -> Result<()> {
+        let loopback = matches!(self.server.host.as_str(), "127.0.0.1" | "localhost" | "::1");
+        if !loopback && self.server.api_key.is_none() {
+            bail!(
+                "AGENT_MEMORY_API_KEY is required when binding to {}",
+                self.server.host
+            );
+        }
+        self.validate_llm()?;
+        self.validate_backends()
+    }
+
+    fn validate_backends(&self) -> Result<()> {
+        match self.storage.backend.as_str() {
+            "sqlite" => {}
+            "postgres" if self.storage.postgres.url.is_empty() => {
+                bail!("storage.postgres.url (AGENT_MEMORY_POSTGRES_URL) is required for backend `postgres`")
+            }
+            "postgres" => {}
+            other => bail!("storage.backend must be `sqlite` or `postgres`, got `{other}`"),
+        }
+        match self.coordination.backend.as_str() {
+            "local" => {}
+            "redis" if self.coordination.redis.url.is_empty() => {
+                bail!("coordination.redis.url (AGENT_MEMORY_REDIS_URL) is required for backend `redis`")
+            }
+            "redis" => {}
+            other => bail!("coordination.backend must be `local` or `redis`, got `{other}`"),
+        }
+        Ok(())
+    }
+
+    fn validate_llm(&self) -> Result<()> {
+        match self.llm.provider.as_str() {
+            "openai" => Ok(()),
+            "cli" => {
+                let cli = &self.llm.cli;
+                if cli.command.trim().is_empty() {
+                    bail!("llm.cli.command (AGENT_MEMORY_LLM_CLI_COMMAND) is required for provider `cli`");
+                }
+                if !matches!(cli.prompt_mode.as_str(), "stdin" | "arg") {
+                    bail!(
+                        "llm.cli.promptMode must be `stdin` or `arg`, got `{}`",
+                        cli.prompt_mode
+                    );
+                }
+                if let Some(dir) = &cli.working_dir {
+                    let path = expand_home(dir);
+                    if !path.is_dir() {
+                        bail!("llm.cli.workingDir does not exist: {}", path.display());
+                    }
+                }
+                Ok(())
+            }
+            other => bail!("llm.provider must be `openai` or `cli`, got `{other}`"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expands_variables_with_defaults() {
+        let lookup = |k: &str| (k == "SET").then(|| "v".to_owned());
+        assert_eq!(
+            expand_vars("a=${SET} b=${UNSET:-d} c=${UNSET}", lookup),
+            "a=v b=d c="
+        );
+    }
+
+    #[test]
+    fn reference_yaml_keys_parse() {
+        let yaml = "server:\n  port: 9000\nllm:\n  model: m\nmemory:\n  pipeline:\n    everyNConversations: 3\n  embedding:\n    provider: none\n";
+        let c: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(c.server.port, 9000);
+        assert_eq!(c.memory.pipeline.every_n_conversations, 3);
+        assert!(!c.memory.embedding.is_enabled());
+    }
+
+    #[test]
+    fn example_config_parses() {
+        let raw = include_str!("../../../config/memory-core.example.yaml");
+        let c: Config = serde_yaml::from_str(&expand_vars(raw, |_| None)).unwrap();
+        assert_eq!(c.llm.provider, "openai");
+        assert_eq!(c.llm.cli.prompt_mode, "stdin");
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn backends_require_their_urls() {
+        let mut c = Config::default();
+        c.storage.backend = "postgres".into();
+        assert!(c.validate().is_err());
+        c.storage.postgres.url = "postgres://localhost/memory".into();
+        c.coordination.backend = "redis".into();
+        assert!(c.validate().is_err());
+        c.coordination.redis.url = "redis://localhost".into();
+        assert!(c.validate().is_ok());
+        c.storage.backend = "oracle".into();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn cli_provider_is_validated() {
+        let mut c = Config::default();
+        c.llm.provider = "cli".into();
+        assert!(c.validate().is_err(), "command is required");
+        c.llm.cli.command = "claude".into();
+        assert!(c.validate().is_ok());
+        c.llm.cli.working_dir = Some("/definitely/missing/dir".into());
+        assert!(c.validate().is_err());
+        c.llm.provider = "other".into();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn arg_lists_parse_from_json_or_words() {
+        assert_eq!(
+            parse_arg_list(r#"["-p", "--model", "a b"]"#),
+            ["-p", "--model", "a b"]
+        );
+        assert_eq!(
+            parse_arg_list("-p  --output-format text"),
+            ["-p", "--output-format", "text"]
+        );
+    }
+
+    #[test]
+    fn public_bind_requires_api_key() {
+        let mut c = Config::default();
+        c.server.host = "0.0.0.0".into();
+        assert!(c.validate().is_err());
+        c.server.api_key = Some("k".into());
+        assert!(c.validate().is_ok());
+    }
+}

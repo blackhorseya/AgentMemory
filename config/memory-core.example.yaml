@@ -1,0 +1,92 @@
+# MemoryCore (Rust) configuration — same keys as the reference memory-core.yaml.
+# ${VAR} and ${VAR:-default} are expanded from the environment; AGENT_MEMORY_* env
+# variables override these values. Never commit real secrets here.
+
+server:
+  host: "127.0.0.1"           # AGENT_MEMORY_HOST; non-loopback requires apiKey
+  port: 8420                  # AGENT_MEMORY_PORT
+  apiKey: "${AGENT_MEMORY_API_KEY:-}"
+  corsOrigins: []             # e.g. ["http://localhost:8125"]
+
+data:
+  baseDir: "~/.agent-memory"   # AGENT_MEMORY_DATA_DIR
+  maxOpenInstances: 100
+
+llm:
+  # "openai": any OpenAI-compatible HTTP API (needs apiKey)
+  # "cli":    a local command-line tool that answers prompts
+  provider: "${AGENT_MEMORY_LLM_PROVIDER:-openai}"
+  baseUrl: "${AGENT_MEMORY_LLM_BASE_URL:-https://api.openai.com/v1}"
+  apiKey: "${AGENT_MEMORY_LLM_API_KEY:-}"
+  model: "${AGENT_MEMORY_LLM_MODEL:-gpt-4o-mini}"
+  maxTokens: 8192
+  timeoutMs: 180000           # also the per-call timeout of the CLI provider
+  cli:
+    command: ""               # e.g. "claude" or "ollama"
+    args: []                  # e.g. ["-p"] or ["run", "llama3.1"]
+    promptMode: "stdin"       # "stdin", or "arg" to substitute {prompt} in args
+    # workingDir: "~/projects/my-app"   # project base path the tool runs in
+    maxConcurrency: 2
+    env: {}                   # extra environment for the tool
+
+memory:
+  extraction:
+    enabled: true
+    enableDedup: true
+    maxMemoriesPerSession: 20
+  persona:
+    triggerEveryN: 50         # regenerate L3 after N new memories
+    maxScenes: 15             # L2 scene cap
+  pipeline:
+    everyNConversations: 5    # L1 after N user rounds (warm-up 1,2,4 first)
+    enableWarmup: true
+    l1IdleTimeoutSeconds: 600
+    l2DelayAfterL1Seconds: 90
+    l2MinIntervalSeconds: 900
+    l2MaxIntervalSeconds: 3600
+  recall:
+    maxResults: 5
+    scoreThreshold: 0.3
+    strategy: "hybrid"        # bm25 | embedding | hybrid (degrades to bm25)
+    timeoutMs: 5000
+  embedding:
+    provider: "none"          # "none" = BM25 only; otherwise OpenAI-compatible
+    # baseUrl: "https://api.openai.com/v1"
+    # apiKey: "${AGENT_MEMORY_EMBEDDING_API_KEY}"
+    # model: "text-embedding-3-small"
+    # dimensions: 1536
+
+skill:
+  enabled: true
+  routing:
+    searchTopK: 20
+  extraction:
+    enabled: true
+    archiveBytes: 40960
+    toolCallThreshold: 10
+  versionTtlDays: 0
+  maxVersions: 100
+
+metadata:
+  maxUsersPerInstance: 500
+  maxTeamsPerInstance: 100
+  maxActiveKeysPerUser: 20
+
+storage:
+  backend: "${AGENT_MEMORY_STORAGE_BACKEND:-sqlite}"   # sqlite | postgres
+  postgres:
+    url: "${AGENT_MEMORY_POSTGRES_URL:-}"            # postgres://user:pass@host:5432/db
+    maxConnections: 10
+
+coordination:
+  backend: "${AGENT_MEMORY_COORDINATION_BACKEND:-local}"  # local | redis
+  redis:
+    url: "${AGENT_MEMORY_REDIS_URL:-}"               # redis://host:6379/0
+    keyPrefix: "agent_memory"
+    lockTtlMs: 600000
+    queueLeaseMs: 900000                             # unacked jobs are redelivered after this
+
+worker:
+  concurrency: 8
+  maxRetries: 3
+  scanIntervalMs: 2000

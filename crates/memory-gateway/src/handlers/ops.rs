@@ -1,0 +1,693 @@
+//! Health, monitoring, prompts, generation logs, knowledge metadata,
+//! chat-memory clearing, instance destruction and legacy v1 endpoints.
+
+use std::collections::HashMap;
+
+use axum::extract::State;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use memory_application::admin::KnowledgeInput;
+use memory_application::common::Page;
+use memory_application::memory::service::NewMessage;
+use memory_application::pipeline::memory_prompts::{ApplyTarget, PromptAction};
+use memory_application::ports::pipeline::{
+    ProfileState, PromptSettingFilter, PromptTarget, SessionState,
+};
+use memory_domain::memory::{Layer, Role};
+use memory_domain::scope::{InstanceId, MemoryScope, SegmentId};
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use crate::context::{Ctx, JsonBody};
+use crate::envelope::{ok, ApiError};
+use crate::state::SharedState;
+
+type ApiResult = Result<Response, ApiError>;
+
+pub async fn health(State(s): State<SharedState>) -> Response {
+    let worker = s
+        .services
+        .pipeline
+        .status(&SegmentId::default_bucket(), 0)
+        .await
+        .ok();
+    Json(json!({
+        "status": if s.health.fts_available { "ok" } else { "degraded" },
+        "version": s.settings.version,
+        "uptime": s.started_at.elapsed().as_secs(),
+        "stores": {
+            "vectorStore": true,
+            "embeddingService": s.health.embedding_enabled,
+            "ftsAvailable": s.health.fts_available,
+            "llmConfigured": s.health.llm_configured,
+            "backend": s.health.storage_backend,
+            "vectorIndex": s.health.vector_index,
+        },
+        "services": {
+            "pipelineWorker": worker.map(|w| json!({"metrics": w.worker, "queue": w.queue})),
+            "stateBackend": s.health.coordination_backend,
+        },
+    }))
+    .into_response()
+}
+
+fn scope_rows(
+    sessions: Vec<SessionState>,
+    profiles: Vec<ProfileState>,
+    every_n: u32,
+) -> Vec<Value> {
+    let by_profile: HashMap<String, &ProfileState> =
+        profiles.iter().map(|p| (p.profile.key(), p)).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut rows: Vec<Value> = sessions
+        .iter()
+        .map(|st| {
+            let key = format!("team:{}|agent:{}", st.scope.team_id, st.scope.agent_id);
+            seen.insert(key.clone());
+            let p = by_profile.get(&key);
+            json!({
+                "scope": key,
+                "team_id": st.scope.team_id, "agent_id": st.scope.agent_id, "user_id": st.scope.user_id, "session_id": st.session_id,
+                "conversation_count": st.conversation_count,
+                "warmup_threshold": memory_domain::pipeline::Warmup(st.warmup).threshold(every_n),
+                "l1_cursor": st.l1_cursor, "l1_due_at": st.l1_due_at, "last_l1_at": st.last_l1_at,
+                "l2_pending": p.map(|p| p.l2_pending), "l2_due_at": p.and_then(|p| p.l2_due_at),
+                "last_l2_at": p.and_then(|p| p.last_l2_at), "last_l3_at": p.and_then(|p| p.last_l3_at),
+                "memories_since_persona": p.map(|p| p.memories_since_persona),
+                "last_active_at": st.last_active_at,
+            })
+        })
+        .collect();
+    rows.extend(profiles.iter().filter(|p| !seen.contains(&p.profile.key())).map(|p| {
+        json!({
+            "scope": p.profile.key(), "team_id": p.profile.team_id, "agent_id": p.profile.agent_id,
+            "user_id": null, "session_id": null, "l2_pending": p.l2_pending, "l2_due_at": p.l2_due_at,
+            "last_l2_at": p.last_l2_at, "last_l3_at": p.last_l3_at, "memories_since_persona": p.memories_since_persona,
+        })
+    }));
+    rows
+}
+
+pub async fn pipeline_status(
+    State(s): State<SharedState>,
+    ctx: Ctx,
+    JsonBody(body): JsonBody,
+) -> ApiResult {
+    let instance = ctx.instance()?;
+    let limit = body
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(50)
+        .clamp(1, 500) as usize;
+    let status = s
+        .services
+        .pipeline
+        .status(&instance, limit)
+        .await
+        .map_err(|e| ctx.err(e))?;
+    let every_n = memory_domain::pipeline::PipelineSettings::default().every_n_conversations;
+    Ok(ok(
+        &ctx.request_id,
+        json!({
+            "worker": status.worker,
+            "queue": status.queue,
+            "scopes": scope_rows(status.sessions, status.profiles, every_n),
+        }),
+    ))
+}
+
+pub async fn stats_overview(State(s): State<SharedState>, ctx: Ctx) -> ApiResult {
+    let instance = ctx.instance()?;
+    Ok(ok(
+        &ctx.request_id,
+        s.services
+            .stats
+            .overview(&instance)
+            .await
+            .map_err(|e| ctx.err(e))?,
+    ))
+}
+
+// ── Generation logs ─────────────────────────────────────────────────────
+
+fn layer_of(ctx: &Ctx, body: &Value) -> Result<Option<Layer>, ApiError> {
+    body.get("layer")
+        .and_then(Value::as_str)
+        .map(Layer::parse)
+        .transpose()
+        .map_err(|e| ctx.err(e))
+}
+
+fn ms_range(body: &Value) -> Option<(i64, i64)> {
+    match (
+        body.get("start_time").and_then(Value::as_i64),
+        body.get("end_time").and_then(Value::as_i64),
+    ) {
+        (Some(a), Some(b)) => Some((a, b)),
+        _ => None,
+    }
+}
+
+pub async fn generation_log_list(
+    State(s): State<SharedState>,
+    ctx: Ctx,
+    JsonBody(body): JsonBody,
+) -> ApiResult {
+    let instance = ctx.instance()?;
+    let status = body
+        .get("status")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let limit = body.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
+    let page = s
+        .services
+        .generation_logs
+        .list(
+            &instance,
+            layer_of(&ctx, &body)?,
+            status,
+            ms_range(&body),
+            limit,
+            body.get("cursor").and_then(Value::as_str),
+        )
+        .await
+        .map_err(|e| ctx.err(e))?;
+    Ok(ok(
+        &ctx.request_id,
+        json!({"items": page.items, "next_cursor": page.next_cursor}),
+    ))
+}
+
+pub async fn generation_log_get(
+    State(s): State<SharedState>,
+    ctx: Ctx,
+    JsonBody(body): JsonBody,
+) -> ApiResult {
+    let instance = ctx.instance()?;
+    let logs = &s.services.generation_logs;
+    let log = match (
+        body.get("log_id").and_then(Value::as_str),
+        body.get("memory_id").and_then(Value::as_str),
+        layer_of(&ctx, &body)?,
+    ) {
+        (Some(id), None, _) => logs.get(&instance, id).await,
+        (None, Some(memory), Some(layer)) => logs.find_by_memory(&instance, layer, memory).await,
+        _ => {
+            return Err(ApiError::bad_request(
+                &ctx.request_id,
+                "provide log_id, or memory_id with layer",
+            ))
+        }
+    }
+    .map_err(|e| ctx.err(e))?;
+    Ok(ok(&ctx.request_id, log))
+}
+
+// ── Memory prompts ──────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct PromptCreate {
+    name: String,
+    layer: String,
+    prompt: String,
+}
+
+pub async fn prompt_create(
+    State(s): State<SharedState>,
+    ctx: Ctx,
+    JsonBody(body): JsonBody,
+) -> ApiResult {
+    let instance = ctx.instance()?;
+    let input: PromptCreate = ctx.parse(&body)?;
+    let layer = Layer::parse(&input.layer).map_err(|e| ctx.err(e))?;
+    let p = s
+        .services
+        .prompts
+        .create(&instance, &input.name, layer, &input.prompt)
+        .await
+        .map_err(|e| ctx.err(e))?;
+    Ok(ok(
+        &ctx.request_id,
+        json!({"memory_prompt_id": p.memory_prompt_id, "version": p.version, "created_at_ms": p.created_at_ms}),
+    ))
+}
+
+fn order_newest(body: &Value) -> bool {
+    body.get("time_order").and_then(Value::as_str) != Some("asc")
+}
+
+fn list_page(body: &Value) -> Page {
+    let n = |k: &str| body.get(k).and_then(Value::as_u64).map(|v| v as usize);
+    Page::standard(n("limit"), n("offset"))
+}
+
+pub async fn prompt_get(
+    State(s): State<SharedState>,
+    ctx: Ctx,
+    JsonBody(body): JsonBody,
+) -> ApiResult {
+    let instance = ctx.instance()?;
+    let prompts = &s.services.prompts;
+    let str_of = |k: &str| body.get(k).and_then(Value::as_str);
+    if let Some(id) = str_of("memory_prompt_id") {
+        return Ok(ok(
+            &ctx.request_id,
+            prompts.get(&instance, id).await.map_err(|e| ctx.err(e))?,
+        ));
+    }
+    let layer = layer_of(&ctx, &body)?.ok_or_else(|| {
+        ApiError::bad_request(&ctx.request_id, "memory_prompt_id or layer is required")
+    })?;
+    if str_of("team_id").is_some() || str_of("agent_id").is_some() {
+        let resolved = prompts
+            .resolve(
+                &instance,
+                str_of("team_id").unwrap_or(""),
+                str_of("agent_id").unwrap_or(""),
+                layer,
+            )
+            .await
+            .map_err(|e| ctx.err(e))?;
+        let data = match resolved {
+            Some(c) => {
+                json!({"source": c.source, "memory_prompt_id": c.memory_prompt_id, "version": c.version, "prompt": c.prompt, "layer": layer})
+            }
+            None => {
+                json!({"source": "builtin", "memory_prompt_id": format!("builtin:{}", layer.as_str()), "prompt": memory_application::pipeline::prompts::builtin(layer), "layer": layer})
+            }
+        };
+        return Ok(ok(&ctx.request_id, data));
+    }
+    let items = prompts
+        .list(
+            &instance,
+            Some(layer),
+            list_page(&body),
+            order_newest(&body),
+        )
+        .await
+        .map_err(|e| ctx.err(e))?;
+    Ok(ok(&ctx.request_id, json!({"items": items})))
+}
+
+pub async fn prompt_update(
+    State(s): State<SharedState>,
+    ctx: Ctx,
+    JsonBody(body): JsonBody,
+) -> ApiResult {
+    let instance = ctx.instance()?;
+    let id = body
+        .get("memory_prompt_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let p = s
+        .services
+        .prompts
+        .update(
+            &instance,
+            id,
+            body.get("name").and_then(Value::as_str),
+            body.get("prompt").and_then(Value::as_str),
+        )
+        .await
+        .map_err(|e| ctx.err(e))?;
+    Ok(ok(
+        &ctx.request_id,
+        json!({"memory_prompt_id": p.memory_prompt_id, "version": p.version, "updated_at_ms": p.updated_at_ms}),
+    ))
+}
+
+pub async fn prompt_delete(
+    State(s): State<SharedState>,
+    ctx: Ctx,
+    JsonBody(body): JsonBody,
+) -> ApiResult {
+    let instance = ctx.instance()?;
+    let mut ids: Vec<String> = ctx.parse(body.get("memory_prompt_ids").unwrap_or(&Value::Null))?;
+    ids.sort();
+    ids.dedup();
+    if ids.is_empty() || ids.len() > 100 {
+        return Err(ApiError::bad_request(
+            &ctx.request_id,
+            "memory_prompt_ids must contain 1-100 ids",
+        ));
+    }
+    let deleted = s
+        .services
+        .prompts
+        .delete(&instance, &ids)
+        .await
+        .map_err(|e| ctx.err(e))?;
+    Ok(ok(
+        &ctx.request_id,
+        json!({"deleted_count": deleted, "memory_prompt_ids": ids}),
+    ))
+}
+
+#[derive(Deserialize)]
+struct PromptSet {
+    action: String,
+    layer: String,
+    memory_prompt_id: Option<String>,
+    team_id: Option<String>,
+    #[serde(default)]
+    agent_ids: Vec<String>,
+}
+
+pub async fn prompt_set(
+    State(s): State<SharedState>,
+    ctx: Ctx,
+    JsonBody(body): JsonBody,
+) -> ApiResult {
+    let instance = ctx.instance()?;
+    let input: PromptSet = ctx.parse(&body)?;
+    let layer = Layer::parse(&input.layer).map_err(|e| ctx.err(e))?;
+    let action = match (input.action.as_str(), input.memory_prompt_id) {
+        ("apply", Some(id)) => PromptAction::Apply {
+            memory_prompt_id: id,
+        },
+        ("apply", None) => {
+            return Err(ApiError::bad_request(
+                &ctx.request_id,
+                "memory_prompt_id is required to apply",
+            ))
+        }
+        ("clear", _) => PromptAction::Clear,
+        _ => {
+            return Err(ApiError::bad_request(
+                &ctx.request_id,
+                "action must be apply or clear",
+            ))
+        }
+    };
+    let affected = s
+        .services
+        .prompts
+        .set(
+            &instance,
+            layer,
+            action,
+            ApplyTarget {
+                team_id: input.team_id,
+                agent_ids: input.agent_ids,
+            },
+        )
+        .await
+        .map_err(|e| ctx.err(e))?;
+    Ok(ok(&ctx.request_id, json!({"affected": affected})))
+}
+
+fn setting_filter(ctx: &Ctx, body: &Value) -> Result<PromptSettingFilter, ApiError> {
+    let s = |k: &str| body.get(k).and_then(Value::as_str).map(str::to_owned);
+    let target_type = match s("target_type").as_deref() {
+        None => None,
+        Some("instance") => Some(PromptTarget::Instance),
+        Some("team") => Some(PromptTarget::Team),
+        Some("agent") => Some(PromptTarget::Agent),
+        Some(other) => {
+            return Err(ApiError::bad_request(
+                &ctx.request_id,
+                format!("invalid target_type: {other}"),
+            ))
+        }
+    };
+    Ok(PromptSettingFilter {
+        memory_prompt_id: s("memory_prompt_id"),
+        target_type,
+        team_id: s("team_id"),
+        agent_id: s("agent_id"),
+        layer: layer_of(ctx, body)?,
+    })
+}
+
+pub async fn prompt_settings(
+    State(s): State<SharedState>,
+    ctx: Ctx,
+    JsonBody(body): JsonBody,
+) -> ApiResult {
+    let instance = ctx.instance()?;
+    let items = s
+        .services
+        .prompts
+        .list_settings(&instance, &setting_filter(&ctx, &body)?, list_page(&body))
+        .await
+        .map_err(|e| ctx.err(e))?;
+    Ok(ok(&ctx.request_id, json!({"items": items})))
+}
+
+pub async fn prompt_log(
+    State(s): State<SharedState>,
+    ctx: Ctx,
+    JsonBody(body): JsonBody,
+) -> ApiResult {
+    let instance = ctx.instance()?;
+    let items = s
+        .services
+        .prompts
+        .logs(
+            &instance,
+            &setting_filter(&ctx, &body)?,
+            body.get("action").and_then(Value::as_str),
+            ms_range(&body),
+            list_page(&body),
+        )
+        .await
+        .map_err(|e| ctx.err(e))?;
+    Ok(ok(&ctx.request_id, json!({"items": items})))
+}
+
+// ── Knowledge, chat memory, instance ────────────────────────────────────
+
+pub async fn knowledge_create(
+    State(s): State<SharedState>,
+    ctx: Ctx,
+    JsonBody(body): JsonBody,
+) -> ApiResult {
+    let instance = ctx.instance()?;
+    let input: KnowledgeInput = ctx.parse(&body)?;
+    Ok(ok(
+        &ctx.request_id,
+        s.services
+            .knowledge
+            .create(&instance, input)
+            .await
+            .map_err(|e| ctx.err(e))?,
+    ))
+}
+
+pub async fn knowledge_get(
+    State(s): State<SharedState>,
+    ctx: Ctx,
+    JsonBody(body): JsonBody,
+) -> ApiResult {
+    let instance = ctx.instance()?;
+    let id = body
+        .get("knowledge_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let team = body.get("team_id").and_then(Value::as_str);
+    Ok(ok(
+        &ctx.request_id,
+        s.services
+            .knowledge
+            .get(&instance, id, team)
+            .await
+            .map_err(|e| ctx.err(e))?,
+    ))
+}
+
+pub async fn knowledge_update(
+    State(s): State<SharedState>,
+    ctx: Ctx,
+    JsonBody(body): JsonBody,
+) -> ApiResult {
+    let instance = ctx.instance()?;
+    let input: KnowledgeInput = ctx.parse(&body)?;
+    Ok(ok(
+        &ctx.request_id,
+        s.services
+            .knowledge
+            .update(&instance, input)
+            .await
+            .map_err(|e| ctx.err(e))?,
+    ))
+}
+
+pub async fn knowledge_delete(
+    State(s): State<SharedState>,
+    ctx: Ctx,
+    JsonBody(body): JsonBody,
+) -> ApiResult {
+    let instance = ctx.instance()?;
+    let ids: Vec<String> = ctx.parse(body.get("knowledge_ids").unwrap_or(&Value::Null))?;
+    let team = body.get("team_id").and_then(Value::as_str);
+    Ok(ok(
+        &ctx.request_id,
+        s.services
+            .knowledge
+            .delete(&instance, &ids, team)
+            .await
+            .map_err(|e| ctx.err(e))?,
+    ))
+}
+
+pub async fn knowledge_list(
+    State(s): State<SharedState>,
+    ctx: Ctx,
+    JsonBody(body): JsonBody,
+) -> ApiResult {
+    let instance = ctx.instance()?;
+    let team = body
+        .get("team_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::bad_request(&ctx.request_id, "team_id is required"))?;
+    let ids: Option<Vec<String>> = body
+        .get("knowledge_ids")
+        .map(|v| ctx.parse(v))
+        .transpose()?;
+    let p = body.get("pagination").cloned().unwrap_or(Value::Null);
+    let page = Page::clamped(
+        p.get("limit").and_then(Value::as_u64).map(|v| v as usize),
+        p.get("offset").and_then(Value::as_u64).map(|v| v as usize),
+        20,
+        1000,
+    );
+    let (items, total) = s
+        .services
+        .knowledge
+        .list(
+            &instance,
+            team,
+            body.get("type").and_then(Value::as_str),
+            ids.as_deref(),
+            page,
+        )
+        .await
+        .map_err(|e| ctx.err(e))?;
+    Ok(ok(
+        &ctx.request_id,
+        json!({"items": items, "total": total, "limit": page.limit, "offset": page.offset}),
+    ))
+}
+
+pub async fn chat_memory_clear(
+    State(s): State<SharedState>,
+    ctx: Ctx,
+    JsonBody(body): JsonBody,
+) -> ApiResult {
+    let instance = ctx.instance()?;
+    let ids: Vec<String> = ctx.parse(body.get("memory_ids").unwrap_or(&Value::Null))?;
+    let items = s
+        .services
+        .chat_memory
+        .clear(&instance, &ids)
+        .await
+        .map_err(|e| ctx.err(e))?;
+    let all_cleared = items.iter().all(|i| i.cleared);
+    Ok(ok(
+        &ctx.request_id,
+        json!({"items": items, "all_cleared": all_cleared}),
+    ))
+}
+
+pub async fn instance_destroy(
+    State(s): State<SharedState>,
+    ctx: Ctx,
+    JsonBody(body): JsonBody,
+) -> ApiResult {
+    let raw = body
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::bad_request(&ctx.request_id, "instance_id is required"))?;
+    let instance: InstanceId = SegmentId::parse("instance_id", raw).map_err(|e| ctx.err(e))?;
+    let cleaned = s
+        .services
+        .lifecycle
+        .destroy(&instance)
+        .await
+        .map_err(|e| ctx.err(e))?;
+    Ok(ok(
+        &ctx.request_id,
+        json!({"instance_id": raw, "cleaned": cleaned}),
+    ))
+}
+
+// ── Legacy v1 ───────────────────────────────────────────────────────────
+
+/// v1 calls carry only a session key; they live in the default buckets of
+/// the `x-memory-service-id` instance (or `default`).
+fn legacy_instance(ctx: &Ctx) -> InstanceId {
+    ctx.instance()
+        .unwrap_or_else(|_| SegmentId::default_bucket())
+}
+
+pub async fn legacy_recall(
+    State(s): State<SharedState>,
+    ctx: Ctx,
+    JsonBody(body): JsonBody,
+) -> Response {
+    let query = body
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if query.is_empty() || body.get("session_key").and_then(Value::as_str).is_none() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"error": "query and session_key are required"})),
+        )
+            .into_response();
+    }
+    let scope = MemoryScope::from_optional(None, None, None, None).expect("default scope");
+    match s.services.recall.recall(&legacy_instance(&ctx), &scope, query, None, None).await {
+        Ok(r) => {
+            let context = [r.prepend_context.clone(), r.append_system_context.clone()].into_iter().flatten().collect::<Vec<_>>().join("\n\n");
+            Json(json!({"context": context, "strategy": r.strategy, "memory_count": r.memories.len(), "code": 0, "message": "ok", "retryable": false})).into_response()
+        }
+        Err(e) => Json(json!({"context": "", "memory_count": 0, "code": 20002, "message": e.to_string(), "retryable": true})).into_response(),
+    }
+}
+
+pub async fn legacy_capture(
+    State(s): State<SharedState>,
+    ctx: Ctx,
+    JsonBody(body): JsonBody,
+) -> Response {
+    let field = |k: &str| body.get(k).and_then(Value::as_str).map(str::to_owned);
+    let (Some(user), Some(assistant), Some(session_key)) = (
+        field("user_content"),
+        field("assistant_content"),
+        field("session_key"),
+    ) else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"error": "user_content, assistant_content and session_key are required"})),
+        )
+            .into_response();
+    };
+    let session = field("session_id").unwrap_or(session_key);
+    let scope = MemoryScope::from_optional(None, None, None, None).expect("default scope");
+    let messages = [(Role::User, user), (Role::Assistant, assistant)]
+        .into_iter()
+        .map(|(role, content)| NewMessage {
+            role,
+            content,
+            timestamp: None,
+            recorded_at: None,
+        })
+        .collect();
+    match s
+        .services
+        .memory
+        .add_conversation(&legacy_instance(&ctx), &scope, &session, messages)
+        .await
+    {
+        Ok(stored) => {
+            Json(json!({"l0_recorded": stored.len(), "scheduler_notified": true})).into_response()
+        }
+        Err(e) => (
+            crate::envelope::status_for(e.kind),
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}

@@ -1,0 +1,68 @@
+//! Pipeline worker metrics shared between the worker and the status API.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+
+use serde::Serialize;
+
+#[derive(Debug, Default)]
+pub struct PipelineMetrics {
+    enqueued: AtomicU64,
+    completed: AtomicU64,
+    failed: AtomicU64,
+    retried: AtomicU64,
+    dead_lettered: AtomicU64,
+    last: Mutex<LastEvent>,
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+struct LastEvent {
+    last_task_at: Option<String>,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsSnapshot {
+    pub tasks_enqueued: u64,
+    pub tasks_completed: u64,
+    pub tasks_failed: u64,
+    pub tasks_retried: u64,
+    pub tasks_dead_lettered: u64,
+    pub last_task_at: Option<String>,
+    pub last_error: Option<String>,
+}
+
+impl PipelineMetrics {
+    pub fn enqueued(&self) {
+        self.enqueued.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn completed(&self, at: String) {
+        self.completed.fetch_add(1, Ordering::Relaxed);
+        self.last.lock().expect("metrics lock").last_task_at = Some(at);
+    }
+
+    pub fn failed(&self, error: String, will_retry: bool) {
+        self.failed.fetch_add(1, Ordering::Relaxed);
+        let counter = if will_retry {
+            &self.retried
+        } else {
+            &self.dead_lettered
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        self.last.lock().expect("metrics lock").last_error = Some(error);
+    }
+
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        let last = self.last.lock().expect("metrics lock").clone();
+        MetricsSnapshot {
+            tasks_enqueued: self.enqueued.load(Ordering::Relaxed),
+            tasks_completed: self.completed.load(Ordering::Relaxed),
+            tasks_failed: self.failed.load(Ordering::Relaxed),
+            tasks_retried: self.retried.load(Ordering::Relaxed),
+            tasks_dead_lettered: self.dead_lettered.load(Ordering::Relaxed),
+            last_task_at: last.last_task_at,
+            last_error: last.last_error,
+        }
+    }
+}

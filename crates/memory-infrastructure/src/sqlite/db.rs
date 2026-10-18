@@ -1,0 +1,168 @@
+//! A SQLite connection usable from async code, and a per-instance pool.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use memory_domain::error::{DomainError, DomainResult};
+use memory_domain::scope::InstanceId;
+use rusqlite::Connection;
+
+use super::{schema, vec_index};
+
+/// Blocking SQLite work runs on the blocking thread pool, one statement
+/// batch at a time per database.
+pub struct Db {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl Db {
+    pub fn open(
+        path: &Path,
+        migrate: fn(&Connection) -> rusqlite::Result<()>,
+    ) -> DomainResult<Self> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| DomainError::unavailable(format!("create {}: {e}", dir.display())))?;
+        }
+        // Before the first open, so every connection gets `vec0` if it loads.
+        vec_index::register();
+        let conn = Connection::open(path).map_err(db_err)?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;",
+        )
+        .map_err(db_err)?;
+        migrate(&conn).map_err(db_err)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    pub async fn call<T, F>(&self, f: F) -> DomainResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> rusqlite::Result<T> + Send + 'static,
+    {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = conn
+                .lock()
+                .map_err(|_| DomainError::internal("database lock poisoned"))?;
+            f(&mut guard).map_err(db_err)
+        })
+        .await
+        .map_err(|e| DomainError::internal(format!("database task failed: {e}")))?
+    }
+
+    /// Like [`Db::call`] for closures that already speak `DomainResult`.
+    pub async fn call_domain<T, F>(&self, f: F) -> DomainResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> DomainResult<T> + Send + 'static,
+    {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = conn
+                .lock()
+                .map_err(|_| DomainError::internal("database lock poisoned"))?;
+            f(&mut guard)
+        })
+        .await
+        .map_err(|e| DomainError::internal(format!("database task failed: {e}")))?
+    }
+}
+
+pub fn db_err(e: rusqlite::Error) -> DomainError {
+    match &e {
+        rusqlite::Error::SqliteFailure(f, _)
+            if f.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            DomainError::conflict("duplicate_entry", e.to_string())
+        }
+        _ => DomainError::unavailable(format!("storage error: {e}")),
+    }
+}
+
+struct Entry {
+    db: Arc<Db>,
+    last_used: Instant,
+}
+
+/// Lazily opens `<data_dir>/instances/<id>/memory.db`, keeping at most
+/// `capacity` connections (least recently used are closed first).
+pub struct InstancePool {
+    data_dir: PathBuf,
+    capacity: usize,
+    entries: Mutex<HashMap<InstanceId, Entry>>,
+}
+
+impl InstancePool {
+    pub fn new(data_dir: PathBuf, capacity: usize) -> Self {
+        Self {
+            data_dir,
+            capacity: capacity.max(1),
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn instance_dir(&self, instance: &InstanceId) -> PathBuf {
+        self.data_dir.join("instances").join(instance.as_str())
+    }
+
+    pub fn get(&self, instance: &InstanceId) -> DomainResult<Arc<Db>> {
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| DomainError::internal("pool lock poisoned"))?;
+        if let Some(entry) = entries.get_mut(instance) {
+            entry.last_used = Instant::now();
+            return Ok(Arc::clone(&entry.db));
+        }
+        if entries.len() >= self.capacity {
+            if let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(k, _)| k.clone())
+            {
+                entries.remove(&oldest);
+            }
+        }
+        let db = Arc::new(Db::open(
+            &self.instance_dir(instance).join("memory.db"),
+            schema::migrate_instance,
+        )?);
+        entries.insert(
+            instance.clone(),
+            Entry {
+                db: Arc::clone(&db),
+                last_used: Instant::now(),
+            },
+        );
+        Ok(db)
+    }
+
+    /// Closes the instance database (in-flight users keep their handle).
+    pub fn evict(&self, instance: &InstanceId) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.remove(instance);
+        }
+    }
+
+    /// Instances that currently have a database on disk.
+    pub fn known_instances(&self) -> Vec<String> {
+        std::fs::read_dir(self.data_dir.join("instances"))
+            .map(|dir| {
+                dir.filter_map(Result::ok)
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn fts_available(&self) -> bool {
+        Connection::open_in_memory()
+            .and_then(|c| c.execute_batch("CREATE VIRTUAL TABLE t USING fts5(x);"))
+            .is_ok()
+    }
+}

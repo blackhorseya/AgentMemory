@@ -1,6 +1,6 @@
 # Agent Memory 
 
-English | [繁體中文](./README.zhtw.md)
+English | [繁體中文](./README.zh-tw.md)
 
 ![Agent-memory](./docs/imgs/agent-memory.jpg "agent memory")
 

@@ -23,9 +23,54 @@ pub fn parse_llm_json<T: DeserializeOwned>(raw: &str, open: char) -> DomainResul
             "malformed JSON payload",
         ));
     }
-    serde_json::from_str(&text[start..=end]).map_err(|e| {
-        DomainError::unprocessable("llm_output_invalid", format!("invalid JSON from LLM: {e}"))
+    serde_json::from_str(&text[start..=end]).or_else(|e| {
+        // A payload missing its final closer (seen with Codex: the trailing
+        // `]` dropped) makes `rfind` land on an inner bracket and cut an
+        // object in half. Retry once with the unclosed brackets balanced.
+        balance_closers(&text[start..])
+            .and_then(|fixed| serde_json::from_str(&fixed).ok())
+            .ok_or_else(|| {
+                DomainError::unprocessable("llm_output_invalid", format!("invalid JSON from LLM: {e}"))
+            })
     })
+}
+
+/// `raw` (from the opening bracket on, minus a trailing code fence) with
+/// the closers of every still-open `[`/`{` appended. `None` when the text
+/// ends inside a string or has a stray closer: those are not truncations
+/// this can repair.
+fn balance_closers(raw: &str) -> Option<String> {
+    let body = raw.trim_end();
+    let body = body.strip_suffix("```").unwrap_or(body).trim_end();
+    let (mut stack, mut in_str, mut escaped) = (Vec::new(), false, false);
+    for c in body.chars() {
+        if in_str {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '[' => stack.push(']'),
+            '{' => stack.push('}'),
+            ']' | '}' => {
+                if stack.pop() != Some(c) {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    if in_str || stack.is_empty() {
+        return None;
+    }
+    let mut fixed = body.trim_end_matches(',').to_owned();
+    fixed.extend(stack.into_iter().rev());
+    Some(fixed)
 }
 
 pub fn strip_think(raw: &str) -> String {
@@ -49,6 +94,22 @@ mod tests {
         let raw = "<think>hmm [x]</think>Sure:\n```json\n[{\"a\":1}]\n```";
         let v: Vec<serde_json::Value> = parse_llm_json(raw, '[').unwrap();
         assert_eq!(v[0]["a"], 1);
+    }
+
+    #[test]
+    fn repairs_a_dropped_final_closer() {
+        let raw = "[{\"t\":\"a\",\"tags\":[\"x\"]},{\"t\":\"b]\",\"tags\":[\"y\",\"z\"]}\n";
+        let v: Vec<serde_json::Value> = parse_llm_json(raw, '[').unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[1]["tags"][1], "z");
+        let fenced = "```json\n[{\"a\":[1]},{\"a\":[2]},\n```";
+        let v: Vec<serde_json::Value> = parse_llm_json(fenced, '[').unwrap();
+        assert_eq!(v[1]["a"][0], 2);
+    }
+
+    #[test]
+    fn does_not_repair_a_cut_string() {
+        assert!(parse_llm_json::<Vec<serde_json::Value>>("[{\"a\":[1]},{\"b\":\"cut", '[').is_err());
     }
 
     #[test]

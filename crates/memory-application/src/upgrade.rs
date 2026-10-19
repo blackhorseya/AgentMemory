@@ -147,6 +147,9 @@ impl LegacyUpgrade {
                 team_id,
                 agent_id,
                 user_id: admin.user_id.clone(),
+                from_team_id: None,
+                from_agent_id: None,
+                from_user_id: None,
                 dry_run: input.dry_run,
             })
             .await?;

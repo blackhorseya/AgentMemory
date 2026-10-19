@@ -211,12 +211,14 @@ pub struct MovedRows {
 /// team and agent: re-homes the `default` buckets in one transaction.
 #[async_trait]
 pub trait ScopeMigrationStore: Send + Sync {
-    /// Moves L0/L1 rows of `default/default/default`, and L2/L3 files and
-    /// skills of team+agent `default/default`, to `to`. With `dry_run` the
-    /// transaction is rolled back and only the counts are reported.
+    /// Moves L0/L1 rows of `from` (team/agent/user), and L2/L3 files and
+    /// skills of team+agent `from`, to `to`. Upstream always passes
+    /// `default/default/default`. With `dry_run` the transaction is rolled
+    /// back and only the counts are reported.
     async fn reassign_default(
         &self,
         instance: &InstanceId,
+        from: &MemoryScope,
         to: &MemoryScope,
         dry_run: bool,
     ) -> DomainResult<MovedRows>;

@@ -674,12 +674,18 @@ async fn legacy_default_data_migrates_on_postgres() {
 /// Writes a turn to the legacy `default/default/default` bucket, as a
 /// pre-0.1.1 client did (the data plane no longer accepts it over HTTP).
 async fn seed_legacy(client: &Client, session: &str, text: &str) {
+    seed_legacy_as(client, None, None, session, text).await;
+}
+
+/// Same, for a pre-0.1.1 client that named its agent and/or user but left
+/// the team empty, so the rows sit outside `default/default/default`.
+async fn seed_legacy_as(client: &Client, agent: Option<&str>, user: Option<&str>, session: &str, text: &str) {
     use memory_application::memory::service::NewMessage;
     use memory_domain::memory::Role;
     use memory_domain::scope::{MemoryScope, SegmentId};
 
     let instance = SegmentId::parse("instance", &client.instance).unwrap();
-    let legacy = MemoryScope::from_optional(None, None, None, None).unwrap();
+    let legacy = MemoryScope::from_optional(None, agent, user, None).unwrap();
     let message = |role, content: &str| NewMessage { role, content: content.into(), timestamp: None, recorded_at: None };
     client
         .state
@@ -751,6 +757,47 @@ async fn assert_legacy_migration(client: &Client) {
         )
         .await;
     assert_eq!(stranger["code"], 400, "{stranger}");
+}
+
+/// `from_*` select a named legacy bucket: rows written as
+/// `default/<agent>/<user>` move, and without them nothing does.
+#[tokio::test(flavor = "multi_thread")]
+async fn named_legacy_scope_migrates_with_from_fields() {
+    let (_data, client) = start().await;
+    seed_legacy_as(&client, Some("hermes"), Some("alice"), "named", "We release v2 next Monday.").await;
+    client.wait_for(|s| s["l1"]["total"] == 2 && s["l2"] == 1 && s["l3"] == 1).await;
+
+    let agent = client
+        .call_as(
+            "/v3/meta/agent/create",
+            &client.admin_key,
+            json!({"team_id": client.team_id, "owner_user_id": client.user_id, "name": "hermes"}),
+        )
+        .await["data"]["agent_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let migrate = |from: Value, dry_run: bool| {
+        let mut body = json!({"team_id": client.team_id, "agent_id": agent, "user_id": client.user_id, "dry_run": dry_run});
+        body.as_object_mut().unwrap().extend(from.as_object().unwrap().clone());
+        client.call_as("/v3/internal/migrate/default-scope", "", body)
+    };
+
+    let default_only = migrate(json!({}), true).await;
+    assert_eq!(default_only["data"]["moved"]["conversations"], 0, "{default_only}");
+    let from = json!({"from_agent_id": "hermes", "from_user_id": "alice"});
+    let dry = migrate(from.clone(), true).await;
+    assert_eq!(dry["data"]["moved"]["conversations"], 2, "{dry}");
+    assert_eq!(dry["data"]["moved"]["atoms"], 2);
+
+    let done = migrate(from, false).await;
+    assert_eq!(done["data"]["moved"], dry["data"]["moved"], "{done}");
+    assert_eq!(done["data"]["session_states"], 1);
+    assert_eq!(done["data"]["profile_states"], 1);
+    let moved = client
+        .call("/v3/atomic/query", json!({"team_id": client.team_id, "agent_id": agent}))
+        .await;
+    assert_eq!(moved["data"]["total"], 2, "{moved}");
 }
 
 /// `internal/upgrade` needs only the instance key: it finds the admin,

@@ -909,6 +909,7 @@ impl ScopeMigrationStore for SqliteMemoryStore {
     async fn reassign_default(
         &self,
         instance: &InstanceId,
+        from: &MemoryScope,
         to: &MemoryScope,
         dry_run: bool,
     ) -> DomainResult<MovedRows> {
@@ -917,31 +918,35 @@ impl ScopeMigrationStore for SqliteMemoryStore {
             to.agent_id.to_string(),
             to.user_id.to_string(),
         );
-        let d = memory_domain::scope::DEFAULT_BUCKET;
+        let (ft, fa, fu) = (
+            from.team_id.to_string(),
+            from.agent_id.to_string(),
+            from.user_id.to_string(),
+        );
         self.pool
             .get(instance)?
             .call(move |conn| {
                 let tx = conn.transaction()?;
-                let triple = "team_id = ?4 AND agent_id = ?4 AND user_id = ?4";
+                let triple = "team_id = ?4 AND agent_id = ?5 AND user_id = ?6";
                 let conversations = tx.execute(
                     &format!("UPDATE conversations SET team_id = ?1, agent_id = ?2, user_id = ?3 WHERE {triple}"),
-                    params![team, agent, user, d],
+                    params![team, agent, user, ft, fa, fu],
                 )?;
                 let atoms = tx.execute(
                     &format!("UPDATE atoms SET team_id = ?1, agent_id = ?2, user_id = ?3 WHERE {triple}"),
-                    params![team, agent, user, d],
+                    params![team, agent, user, ft, fa, fu],
                 )?;
                 let profile_files = tx.execute(
-                    "UPDATE profile_files SET team_id = ?1, agent_id = ?2 WHERE team_id = ?3 AND agent_id = ?3",
-                    params![team, agent, d],
+                    "UPDATE profile_files SET team_id = ?1, agent_id = ?2 WHERE team_id = ?3 AND agent_id = ?4",
+                    params![team, agent, ft, fa],
                 )?;
                 let skill_versions = tx.execute(
                     "UPDATE skills SET team_id = ?1, owner_agent_id = ?2, \
-                     owner_user_id = CASE owner_user_id WHEN ?4 THEN ?3 ELSE owner_user_id END, \
+                     owner_user_id = CASE owner_user_id WHEN ?6 THEN ?3 ELSE owner_user_id END, \
                      doc = json_set(doc, '$.team_id', ?1, '$.owner_agent_id', ?2, '$.owner_user_id', \
-                                    CASE owner_user_id WHEN ?4 THEN ?3 ELSE owner_user_id END) \
-                     WHERE team_id = ?4 AND owner_agent_id = ?4",
-                    params![team, agent, user, d],
+                                    CASE owner_user_id WHEN ?6 THEN ?3 ELSE owner_user_id END) \
+                     WHERE team_id = ?4 AND owner_agent_id = ?5",
+                    params![team, agent, user, ft, fa, fu],
                 )?;
                 // The vec0 index partitions by team; rebuild it from the rows.
                 if atoms > 0 {

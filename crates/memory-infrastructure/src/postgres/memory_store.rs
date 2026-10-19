@@ -831,12 +831,13 @@ impl ScopeMigrationStore for PostgresMemoryStore {
     async fn reassign_default(
         &self,
         instance: &InstanceId,
+        from: &MemoryScope,
         to: &MemoryScope,
         dry_run: bool,
     ) -> DomainResult<MovedRows> {
         let s = self.db.schema(instance).await?;
         let (team, agent, user) = (to.team_id.as_str(), to.agent_id.as_str(), to.user_id.as_str());
-        let d = memory_domain::scope::DEFAULT_BUCKET;
+        let (ft, fa, fu) = (from.team_id.as_str(), from.agent_id.as_str(), from.user_id.as_str());
         let mut tx = self.db.begin().await?;
         let mut run = async |sql: String, binds: &[&str]| -> DomainResult<usize> {
             let mut q = sqlx::query(&sql);
@@ -845,32 +846,32 @@ impl ScopeMigrationStore for PostgresMemoryStore {
             }
             Ok(q.execute(&mut *tx).await.map_err(pg_err)?.rows_affected() as usize)
         };
-        let triple = "team_id = $4 AND agent_id = $4 AND user_id = $4";
+        let triple = "team_id = $4 AND agent_id = $5 AND user_id = $6";
         let conversations = run(
             format!("UPDATE {s}.conversations SET team_id = $1, agent_id = $2, user_id = $3 WHERE {triple}"),
-            &[team, agent, user, d],
+            &[team, agent, user, ft, fa, fu],
         )
         .await?;
         let atoms = run(
             format!("UPDATE {s}.atoms SET team_id = $1, agent_id = $2, user_id = $3 WHERE {triple}"),
-            &[team, agent, user, d],
+            &[team, agent, user, ft, fa, fu],
         )
         .await?;
         let profile_files = run(
-            format!("UPDATE {s}.profile_files SET team_id = $1, agent_id = $2 WHERE team_id = $3 AND agent_id = $3"),
-            &[team, agent, d],
+            format!("UPDATE {s}.profile_files SET team_id = $1, agent_id = $2 WHERE team_id = $3 AND agent_id = $4"),
+            &[team, agent, ft, fa],
         )
         .await?;
         let skill_versions = run(
             format!(
                 "UPDATE {s}.skills SET team_id = $1, owner_agent_id = $2, \
-                 owner_user_id = CASE WHEN owner_user_id = $4 THEN $3 ELSE owner_user_id END, \
+                 owner_user_id = CASE WHEN owner_user_id = $6 THEN $3 ELSE owner_user_id END, \
                  doc = jsonb_set(jsonb_set(jsonb_set(doc, '{{team_id}}', to_jsonb($1::text)), \
                        '{{owner_agent_id}}', to_jsonb($2::text)), '{{owner_user_id}}', \
-                       to_jsonb(CASE WHEN owner_user_id = $4 THEN $3 ELSE owner_user_id END)) \
-                 WHERE team_id = $4 AND owner_agent_id = $4"
+                       to_jsonb(CASE WHEN owner_user_id = $6 THEN $3 ELSE owner_user_id END)) \
+                 WHERE team_id = $4 AND owner_agent_id = $5"
             ),
-            &[team, agent, user, d],
+            &[team, agent, user, ft, fa, fu],
         )
         .await?;
         drop(run);

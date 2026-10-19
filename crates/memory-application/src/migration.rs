@@ -21,6 +21,14 @@ pub struct MigrateDefaultInput {
     pub team_id: String,
     pub agent_id: String,
     pub user_id: String,
+    /// Source bucket; each part defaults to `default` (upstream behaviour).
+    /// Lets pre-0.1.1 data written under named agents/users move too.
+    #[serde(default)]
+    pub from_team_id: Option<String>,
+    #[serde(default)]
+    pub from_agent_id: Option<String>,
+    #[serde(default)]
+    pub from_user_id: Option<String>,
     #[serde(default)]
     pub dry_run: bool,
 }
@@ -94,7 +102,7 @@ impl LegacyScopeMigration {
     /// target, so any well-formed scope will do.
     pub async fn pending(&self, instance: &InstanceId) -> DomainResult<MovedRows> {
         let probe = MemoryScope::from_optional(None, None, None, None)?;
-        self.rows.reassign_default(instance, &probe, true).await
+        self.rows.reassign_default(instance, &probe, &probe, true).await
     }
 
     pub async fn migrate_default(
@@ -103,9 +111,14 @@ impl LegacyScopeMigration {
         input: MigrateDefaultInput,
     ) -> DomainResult<MigrationReport> {
         let to = self.validate(instance, &input).await?;
-        let from = MemoryScope::from_optional(None, None, None, None)?;
+        let from = MemoryScope::from_optional(
+            input.from_team_id.as_deref(),
+            input.from_agent_id.as_deref(),
+            input.from_user_id.as_deref(),
+            None,
+        )?;
         let from_profile = ProfileScope::from(&from);
-        let pending = self.rows.reassign_default(instance, &to, true).await?;
+        let pending = self.rows.reassign_default(instance, &from, &to, true).await?;
 
         let sessions: Vec<_> = self
             .state
@@ -129,7 +142,7 @@ impl LegacyScopeMigration {
         // The target agent must have no L2/L3 yet: scenes are versioned
         // files, and merging two sets of them is not something to do silently.
         self.ensure_fresh_target(instance, &to).await?;
-        let moved = if input.dry_run { pending } else { self.rows.reassign_default(instance, &to, false).await? };
+        let moved = if input.dry_run { pending } else { self.rows.reassign_default(instance, &from, &to, false).await? };
         let report = MigrationReport {
             dry_run: input.dry_run,
             to: to.clone(),

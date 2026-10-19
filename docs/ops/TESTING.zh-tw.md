@@ -2,7 +2,7 @@
 
 [English](TESTING.md)
 
-依你修改的範圍跑對應的測試；發版前全部都要跑。
+依你修改的範圍跑對應的測試；發版前全部都要跑。CI 會在每個 pull request 跑第 1 到 4 節（[RELEASE.zh-tw.md §5](RELEASE.zh-tw.md#5-自動化)）；第 5 節和截圖比對仍然要手動做。
 
 ## 目錄
 
@@ -23,7 +23,7 @@ cargo test --workspace --locked
 
 - 格式採用 rustfmt 預設值，沒有 `rustfmt.toml`。
 - Clippy 在 `-D warnings` 下必須沒有任何警告。新版工具鏈可能會加入新的 lint，所以請用目前的 stable 版本跑。
-- workspace 宣告 `rust-version = "1.88"`。較新的本機工具鏈會編譯 1.88 不接受的程式碼；用到較新的語言或函式庫功能時，請用 `cargo +1.88 check --workspace --locked` 確認。
+- workspace 宣告 `rust-version = "1.88"`，每個 crate 都繼承這個設定。較新的本機工具鏈會編譯 1.88 不接受的程式碼；用到較新的語言或函式庫功能時，請用 `cargo +1.88 check --workspace --locked` 確認。`.cargo/config.toml` 讓 `cargo update` 只挑仍支援 1.88 的依賴版本；其他問題由 CI 的 msrv job 抓出來。
 - `cargo test` 包含單元測試，以及 `crates/memory-server/tests/e2e.rs` 的端到端測試（以 SQLite 和 local 協調後端啟動真正的伺服器）。同一次執行裡的 Postgres 和 Redis 測試，在沒有設定的情況下會印出 `skipping: …` 並視為通過（見下一節）。
 
 ## 2. Postgres 與 Redis 整合測試
@@ -81,7 +81,7 @@ docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.10.0 -x \
   install.sh upgrade.sh uninstall.sh migrate-to-postgres.sh
 ```
 
-`upgrade.sh` 和 `migrate-to-postgres.sh` 會 `source ./install.sh` 取用共用函式，所以要加 `-x`。v0.10.0 目前已知的警告，要在 shellcheck 成為 CI 必過項目之前修掉：`install.sh` 的 SC2174（`mkdir -p -m`），`uninstall.sh` 的 SC2015（`A && B || C`）和 SC2013（用 `for` 走訪 `cat` 的輸出）。新的腳本應該沒有任何警告。
+`upgrade.sh` 和 `migrate-to-postgres.sh` 會 `source ./install.sh` 取用共用函式，所以要加 `-x`。CI 會跑同一個指令（另外加上 `.github/scripts/*.sh`），只要有任何警告就失敗，所以每支腳本都要保持沒有警告。
 
 腳本的實際行為只能靠實際執行來測（見下一節）。
 

@@ -21,8 +21,12 @@ export function coreFetch(handler: (url: string, init: RequestInit) => Response 
     const url = String(input);
     if (url.endsWith("/v3/meta/auth/verify")) {
       const body = JSON.parse(String(init.body)) as { user_key: string };
-      const valid = body.user_key === "sk-mem-good";
-      return jsonResponse(ok({ valid, user: valid ? { user_id: "usr_1", user_type: "system_admin" } : null }));
+      const users: Record<string, { user_id: string; user_type: string }> = {
+        "sk-mem-good": { user_id: "usr_1", user_type: "system_admin" },
+        "sk-mem-viewer": { user_id: "usr_2", user_type: "normal" },
+      };
+      const user = users[body.user_key] ?? null;
+      return jsonResponse(ok({ valid: user !== null, user }));
     }
     return handler(url, init);
   });

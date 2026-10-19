@@ -1,0 +1,3 @@
+name: agentmemory
+version: 2.0.0
+description: "AgentMemory — self-hosted memory core via the `amem` client: recall before each turn, capture each turn (tool calls included, secrets redacted, queued while offline)."

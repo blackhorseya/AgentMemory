@@ -6,10 +6,12 @@ import { CodeBlock } from "../../components/CodeBlock";
 import { EmptyState, ErrorBanner, Notice, Spinner } from "../../components/Feedback";
 import { TextArea } from "../../components/Field";
 import { useAction } from "../../hooks/useAction";
+import { useIsAdmin } from "../auth/session";
 import { useAsync } from "../../hooks/useAsync";
 import { formatTime } from "../../lib/format";
 
 export function L3Tab({ scope }: { scope: Scope }) {
+  const admin = useIsAdmin();
   const persona = useAsync(() => api.core.read(scope), [scope]);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
@@ -43,9 +45,11 @@ export function L3Tab({ scope }: { scope: Scope }) {
             </Button>
           </>
         ) : (
-          <Button size="sm" onClick={startEdit} disabled={persona.loading}>
-            {content === null ? "Create" : "Edit"}
-          </Button>
+          admin && (
+            <Button size="sm" onClick={startEdit} disabled={persona.loading}>
+              {content === null ? "Create" : "Edit"}
+            </Button>
+          )
         )
       }
     >

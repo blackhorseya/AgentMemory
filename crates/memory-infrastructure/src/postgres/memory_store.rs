@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use memory_application::common::{Page, Scored};
 use memory_application::ports::memory::{
     AtomFilter, AtomRepository, AtomSelector, ConversationFilter, ConversationRepository,
-    ProfileFileRepository, Sequenced,
+    MovedRows, ProfileFileRepository, ScopeMigrationStore, Sequenced,
 };
 use memory_domain::error::DomainResult;
 use memory_domain::memory::{AtomType, AtomicMemory, ConversationMessage, Role};
@@ -823,5 +823,62 @@ impl ProfileFileRepository for PostgresMemoryStore {
             &w.params,
         )
         .await
+    }
+}
+
+#[async_trait]
+impl ScopeMigrationStore for PostgresMemoryStore {
+    async fn reassign_default(
+        &self,
+        instance: &InstanceId,
+        to: &MemoryScope,
+        dry_run: bool,
+    ) -> DomainResult<MovedRows> {
+        let s = self.db.schema(instance).await?;
+        let (team, agent, user) = (to.team_id.as_str(), to.agent_id.as_str(), to.user_id.as_str());
+        let d = memory_domain::scope::DEFAULT_BUCKET;
+        let mut tx = self.db.begin().await?;
+        let mut run = async |sql: String, binds: &[&str]| -> DomainResult<usize> {
+            let mut q = sqlx::query(&sql);
+            for b in binds {
+                q = q.bind(*b);
+            }
+            Ok(q.execute(&mut *tx).await.map_err(pg_err)?.rows_affected() as usize)
+        };
+        let triple = "team_id = $4 AND agent_id = $4 AND user_id = $4";
+        let conversations = run(
+            format!("UPDATE {s}.conversations SET team_id = $1, agent_id = $2, user_id = $3 WHERE {triple}"),
+            &[team, agent, user, d],
+        )
+        .await?;
+        let atoms = run(
+            format!("UPDATE {s}.atoms SET team_id = $1, agent_id = $2, user_id = $3 WHERE {triple}"),
+            &[team, agent, user, d],
+        )
+        .await?;
+        let profile_files = run(
+            format!("UPDATE {s}.profile_files SET team_id = $1, agent_id = $2 WHERE team_id = $3 AND agent_id = $3"),
+            &[team, agent, d],
+        )
+        .await?;
+        let skill_versions = run(
+            format!(
+                "UPDATE {s}.skills SET team_id = $1, owner_agent_id = $2, \
+                 owner_user_id = CASE WHEN owner_user_id = $4 THEN $3 ELSE owner_user_id END, \
+                 doc = jsonb_set(jsonb_set(jsonb_set(doc, '{{team_id}}', to_jsonb($1::text)), \
+                       '{{owner_agent_id}}', to_jsonb($2::text)), '{{owner_user_id}}', \
+                       to_jsonb(CASE WHEN owner_user_id = $4 THEN $3 ELSE owner_user_id END)) \
+                 WHERE team_id = $4 AND owner_agent_id = $4"
+            ),
+            &[team, agent, user, d],
+        )
+        .await?;
+        drop(run);
+        if dry_run {
+            tx.rollback().await.map_err(pg_err)?;
+        } else {
+            tx.commit().await.map_err(pg_err)?;
+        }
+        Ok(MovedRows { conversations, atoms, profile_files, skill_versions })
     }
 }

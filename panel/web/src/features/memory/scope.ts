@@ -1,7 +1,12 @@
 import type { Scope } from "../../api";
 import { createPersistedStore } from "../../lib/store";
 
-export const DEFAULT_SCOPE: Scope = { team_id: "default", agent_id: "default", user_id: "default" };
+/** Empty until the picker selects a real team and agent (Core has no default bucket). */
+export const DEFAULT_SCOPE: Scope = { team_id: "", agent_id: "", user_id: "" };
+
+export function isComplete(scope: Scope): boolean {
+  return !!scope.team_id && !!scope.agent_id;
+}
 
 function isScope(v: unknown): v is Scope {
   if (typeof v !== "object" || v === null) return false;

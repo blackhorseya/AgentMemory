@@ -10,11 +10,11 @@
 # Non-interactive variables (all optional):
 #   INSTALL_STORAGE        sqlite | postgres-docker | postgres-url   (default sqlite)
 #   INSTALL_COORDINATION   local | redis-docker | redis-url          (default local)
-#   INSTALL_LLM            openai | claude | antigravity             (default openai)
+#   INSTALL_LLM            openai | claude | antigravity | codex     (default openai)
 #   INSTALL_ADMIN_NAME     first administrator's username            (default admin)
 #   AGENT_MEMORY_POSTGRES_URL, AGENT_MEMORY_REDIS_URL, AGENT_MEMORY_LLM_BASE_URL,
 #   AGENT_MEMORY_LLM_API_KEY, AGENT_MEMORY_LLM_MODEL, ANTHROPIC_API_KEY,
-#   PROJECT_DIR, CORE_PORT, PANEL_PORT
+#   PROJECT_DIR, CORE_PORT, PANEL_PORT, MEMORY_IMAGE_TAG
 # ──────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -89,6 +89,23 @@ choose() {
     fi
     warn "Please enter a number between 1 and $#."
   done
+}
+
+# read_env_file FILE — load KEY=VALUE lines as plain shell variables, taking
+# values literally and without exporting them. `source` would strip the quotes
+# inside JSON values such as AGENT_MEMORY_LLM_CLI_ARGS, and an exported value
+# overrides .env when docker compose interpolates docker-compose.yml.
+read_env_file() {
+  local line key value
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
+    [[ $line =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+    key=${BASH_REMATCH[1]} value=${BASH_REMATCH[2]}
+    if [[ $value =~ ^\'(.*)\'$ ]]; then
+      value=${BASH_REMATCH[1]}
+    fi
+    printf -v "$key" '%s' "$value"
+  done <"$1"
 }
 
 random_secret() {
@@ -218,7 +235,8 @@ configure_llm() {
   choose INSTALL_LLM "LLM used to distil memories" openai \
     "openai|OpenAI-compatible HTTP API (base URL + API key; works with self-hosted models)" \
     "claude|Claude Code CLI (bundled in the image)" \
-    "antigravity|Antigravity CLI (bundled in the image)"
+    "antigravity|Antigravity CLI (bundled in the image)" \
+    "codex|Codex CLI (bundled in the image)"
   LLM_PROVIDER=openai
   LLM_CLI_COMMAND="" LLM_CLI_ARGS="" LLM_CLI_PROMPT_MODE=stdin
   case $INSTALL_LLM in
@@ -234,11 +252,20 @@ configure_llm() {
     antigravity)
       LLM_PROVIDER=cli LLM_CLI_COMMAND=agy LLM_CLI_ARGS='["-p","{prompt}"]' LLM_CLI_PROMPT_MODE=arg
       ;;
+    codex)
+      # Read-only, no session file, and no hooks: a memory client installed
+      # for Codex must never capture the distillation prompts themselves.
+      LLM_PROVIDER=cli LLM_CLI_COMMAND=codex
+      LLM_CLI_ARGS='["exec","--skip-git-repo-check","--ephemeral","-s","read-only","-c","features.hooks=false","-"]'
+      ;;
     *) fail "Unknown INSTALL_LLM: $INSTALL_LLM" ;;
   esac
   if [[ $LLM_PROVIDER == cli ]]; then
     ask PROJECT_DIR "Project directory the CLI works in" "${PROJECT_DIR:-./workspace}"
-    mkdir -p "$PROJECT_DIR"
+    # The CLI runs inside the container as a non-root user with this as its
+    # working directory, so a directory we create must stay traversable even
+    # under a restrictive umask. An existing directory keeps its permissions.
+    [[ -d $PROJECT_DIR ]] || mkdir -p -m 755 "$PROJECT_DIR"
   fi
 }
 
@@ -269,6 +296,7 @@ AGENT_MEMORY_API_KEY=$AGENT_MEMORY_API_KEY
 CORE_PORT=$CORE_PORT
 PANEL_PORT=$PANEL_PORT
 CORE_INSTANCE_ID=default
+MEMORY_IMAGE_TAG=${MEMORY_IMAGE_TAG:-local}
 
 AGENT_MEMORY_STORAGE_BACKEND=$STORAGE_BACKEND
 AGENT_MEMORY_POSTGRES_URL=${AGENT_MEMORY_POSTGRES_URL:-}
@@ -346,6 +374,10 @@ print_summary() {
     antigravity)
       info "Log in to Antigravity once: docker compose exec -it memory-core agy   (open the printed URL)"
       ;;
+    codex)
+      info "Log in to Codex once: docker compose exec -it memory-core codex login --device-auth"
+      info "  (or with an API key: docker compose exec -T memory-core codex login --with-api-key < key-file)"
+      ;;
     openai)
       [[ -z ${AGENT_MEMORY_LLM_API_KEY:-} ]] && warn "No LLM API key yet: memories are stored but not distilled until you add AGENT_MEMORY_LLM_API_KEY to $ENV_FILE and run 'docker compose up -d'."
       ;;
@@ -367,15 +399,13 @@ main() {
     local reuse
     ask reuse "$ENV_FILE exists. Reuse it and just (re)start? (y/n)" y
     if [[ $reuse =~ ^[Yy] ]]; then
-      set -a
-      # shellcheck disable=SC1090
-      source "$ENV_FILE"
-      set +a
+      read_env_file "$ENV_FILE"
       STORAGE_BACKEND=${AGENT_MEMORY_STORAGE_BACKEND:-sqlite}
       COORDINATION_BACKEND=${AGENT_MEMORY_COORDINATION_BACKEND:-local}
       case ${AGENT_MEMORY_LLM_CLI_COMMAND:-} in
         claude) INSTALL_LLM=claude ;;
         agy) INSTALL_LLM=antigravity ;;
+        codex) INSTALL_LLM=codex ;;
         *) INSTALL_LLM=openai ;;
       esac
       start_services
@@ -397,4 +427,7 @@ main() {
   print_summary
 }
 
-main "$@"
+# upgrade.sh sources this file for its helpers.
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi

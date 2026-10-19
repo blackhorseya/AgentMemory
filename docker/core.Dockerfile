@@ -9,10 +9,12 @@
 #     -e AGENT_MEMORY_LLM_CLI_ARGS=-p -e ANTHROPIC_API_KEY=sk-ant-... \
 #     -v memory-core-data:/data memory-core:local
 #
-# Bundled CLIs (official native installers, no npm; both verify checksums):
+# Bundled CLIs (official native installers, no npm; all verify checksums):
 #   claude  Claude Code      https://claude.ai/install.sh
 #   agy     Antigravity CLI  https://antigravity.google/cli/install.sh
-# Skip either with --build-arg INSTALL_CLAUDE=false / INSTALL_ANTIGRAVITY=false.
+#   codex   Codex CLI        https://chatgpt.com/codex/install.sh
+# Skip any with --build-arg INSTALL_CLAUDE=false / INSTALL_ANTIGRAVITY=false /
+# INSTALL_CODEX=false.
 # ──────────────────────────────────────────────────────────────────────
 
 FROM rust:1-slim-bookworm AS build
@@ -42,6 +44,7 @@ ENV PATH="/home/memory/.local/bin:${PATH}"
 ARG INSTALL_CLAUDE=true
 ARG CLAUDE_VERSION=stable
 ARG INSTALL_ANTIGRAVITY=true
+ARG INSTALL_CODEX=true
 RUN set -eu; \
     if [ "$INSTALL_CLAUDE" = "true" ]; then \
       curl -fsSL https://claude.ai/install.sh -o /tmp/install-claude.sh; \
@@ -55,9 +58,17 @@ RUN set -eu; \
       rm /tmp/install-agy.sh; \
       test -x /home/memory/.local/bin/agy; \
     fi; \
+    if [ "$INSTALL_CODEX" = "true" ]; then \
+      curl -fsSL https://chatgpt.com/codex/install.sh -o /tmp/install-codex.sh; \
+      # The binary goes under CODEX_HOME; keep it out of ~/.codex, where the
+      # login volume is mounted and would hide it.
+      CODEX_HOME=/home/memory/.codex-cli sh /tmp/install-codex.sh; \
+      rm /tmp/install-codex.sh; \
+      codex --version; \
+    fi; \
     # Pre-create the login directories so volumes mounted there stay
     # owned by the service user (Docker would create them as root).
-    mkdir -p /home/memory/.claude /home/memory/.gemini
+    mkdir -p /home/memory/.claude /home/memory/.gemini /home/memory/.codex
 
 COPY --from=build /usr/local/bin/memory-server /usr/local/bin/memory-server
 COPY config/memory-core.example.yaml /config/memory-core.yaml

@@ -1,47 +1,88 @@
 import { useEffect, useState, type FormEvent } from "react";
-import type { Scope } from "../../api";
+import { api, type Scope } from "../../api";
 import { Button } from "../../components/Button";
-import { Field, Input } from "../../components/Field";
-import { DEFAULT_SCOPE } from "./scope";
+import { ErrorBanner } from "../../components/Feedback";
+import { Field, Input, Select } from "../../components/Field";
+import { useAsync } from "../../hooks/useAsync";
+import { useStore } from "../../hooks/useStore";
+import { isSystemAdmin, sessionStore } from "../auth/session";
 
-const FIELDS: ReadonlyArray<[keyof Scope, string]> = [
-  ["team_id", "team_id"],
-  ["agent_id", "agent_id"],
-  ["user_id", "user_id"],
-];
+const LIMIT = 100;
 
+/**
+ * Picks a scope Core will authorize: a team the viewer can see, an agent of
+ * that team, and (system admins only) any user; everyone else browses their
+ * own memory.
+ */
 export function ScopePicker({ value, onChange }: { value: Scope; onChange: (scope: Scope) => void }) {
+  const session = useStore(sessionStore);
+  const self = session?.user.user_id ?? "";
+  const admin = isSystemAdmin(session);
   const [draft, setDraft] = useState(value);
   useEffect(() => setDraft(value), [value]);
-  const dirty = FIELDS.some(([k]) => draft[k] !== value[k]);
+
+  const teams = useAsync(
+    () => (admin ? api.admin.allTeams({ limit: LIMIT }) : api.meta.teams(self, { limit: LIMIT })),
+    [self, admin],
+    !!self,
+  );
+  const agents = useAsync(() => api.meta.agents(draft.team_id, { limit: LIMIT }), [draft.team_id], !!draft.team_id);
+
+  // Keep the draft pointing at something that exists (e.g. after a team was deleted).
+  useEffect(() => {
+    const ids = teams.data?.items.map((t) => t.team_id);
+    if (ids && !ids.includes(draft.team_id)) setDraft((d) => ({ ...d, team_id: ids[0] ?? "", agent_id: "" }));
+  }, [teams.data, draft.team_id]);
+  useEffect(() => {
+    const ids = agents.data?.items.map((a) => a.agent_id);
+    if (ids && !ids.includes(draft.agent_id)) setDraft((d) => ({ ...d, agent_id: ids[0] ?? "" }));
+  }, [agents.data, draft.agent_id]);
+
+  const next: Scope = { ...draft, user_id: admin ? draft.user_id.trim() || self : self };
+  const dirty = next.team_id !== value.team_id || next.agent_id !== value.agent_id || next.user_id !== value.user_id;
 
   function apply(e: FormEvent) {
     e.preventDefault();
-    onChange({
-      team_id: draft.team_id.trim() || "default",
-      agent_id: draft.agent_id.trim() || "default",
-      user_id: draft.user_id.trim() || "default",
-    });
+    onChange(next);
   }
+
+  const teamOptions = (teams.data?.items ?? []).map((t) => ({ value: t.team_id, label: t.name }));
+  const agentOptions = (agents.data?.items ?? []).map((a) => ({ value: a.agent_id, label: a.name }));
 
   return (
     <form onSubmit={apply} className="flex flex-wrap items-end gap-2 rounded-md border border-line bg-surface p-3">
-      {FIELDS.map(([key, label]) => (
-        <Field key={key} label={label}>
-          <Input
-            value={draft[key]}
-            onChange={(e) => setDraft({ ...draft, [key]: e.target.value })}
-            placeholder="default"
-            className="mono w-48"
-          />
-        </Field>
-      ))}
-      <Button type="submit" variant={dirty ? "primary" : "secondary"}>
+      <Field label="Team">
+        <Select
+          aria-label="Team"
+          options={teamOptions.length ? teamOptions : [{ value: "", label: "No team" }]}
+          value={draft.team_id}
+          onChange={(e) => setDraft({ ...draft, team_id: e.target.value, agent_id: "" })}
+          className="w-48"
+        />
+      </Field>
+      <Field label="Agent">
+        <Select
+          aria-label="Agent"
+          options={agentOptions.length ? agentOptions : [{ value: "", label: "No agent" }]}
+          value={draft.agent_id}
+          onChange={(e) => setDraft({ ...draft, agent_id: e.target.value })}
+          className="w-48"
+        />
+      </Field>
+      <Field label="user_id">
+        <Input
+          value={admin ? draft.user_id : self}
+          onChange={(e) => setDraft({ ...draft, user_id: e.target.value })}
+          placeholder={self}
+          disabled={!admin}
+          title={admin ? undefined : "You can only browse your own memory"}
+          className="mono w-56"
+        />
+      </Field>
+      <Button type="submit" variant={dirty ? "primary" : "secondary"} disabled={!next.team_id || !next.agent_id}>
         Apply scope
       </Button>
-      <Button variant="ghost" onClick={() => onChange(DEFAULT_SCOPE)}>
-        Reset
-      </Button>
+      <ErrorBanner error={teams.error ?? agents.error} className="basis-full" />
       <p className="basis-full text-xxs text-muted">L0/L1 are isolated by team + agent + user; L2/L3 by team + agent only.</p>
     </form>
   );

@@ -8,6 +8,8 @@ use memory_application::admin::{
     ChatMemoryService, InstanceLifecycle, KnowledgeService, StatsService,
 };
 use memory_application::memory::recall::{RecallService, RecallSettings};
+use memory_application::migration::LegacyScopeMigration;
+use memory_application::upgrade::LegacyUpgrade;
 use memory_application::memory::search::AtomSearcher;
 use memory_application::memory::service::{ConversationObserver, MemoryService};
 use memory_application::memory::session::SessionService;
@@ -252,6 +254,13 @@ pub async fn build(config: &Config) -> Result<App> {
             Arc::new(StateCleanup::new(Arc::clone(&coordination.state))),
         ),
     ]));
+    let migration = Arc::new(LegacyScopeMigration::new(
+        Arc::clone(&storage.meta),
+        Arc::clone(&storage.profiles),
+        Arc::clone(&storage.scope_migration),
+        Arc::clone(&coordination.state),
+    ));
+    let upgrade = Arc::new(LegacyUpgrade::new(Arc::clone(&meta), Arc::clone(&migration)));
     let services = Services {
         recall: Arc::new(RecallService::new(
             Arc::clone(&searcher),
@@ -279,6 +288,8 @@ pub async fn build(config: &Config) -> Result<App> {
         skills,
         skill_extraction,
         lifecycle,
+        migration,
+        upgrade,
     };
 
     let worker = WorkerSettings {

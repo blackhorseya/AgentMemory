@@ -1,4 +1,5 @@
 import type { UserPublic } from "../../api/types";
+import { useStore } from "../../hooks/useStore";
 import { createPersistedStore } from "../../lib/store";
 
 export interface Session {
@@ -15,6 +16,15 @@ function isSession(v: unknown): v is Session | null {
 }
 
 export const sessionStore = createPersistedStore<Session | null>("memory-panel.session", null, isSession);
+
+export function isSystemAdmin(session: Session | null | undefined): boolean {
+  return session?.user.user_type === "system_admin";
+}
+
+/** v1 permissions: system admins configure and edit, everyone else reads. */
+export function useIsAdmin(): boolean {
+  return isSystemAdmin(useStore(sessionStore));
+}
 
 export function signOut(): void {
   sessionStore.set(null);

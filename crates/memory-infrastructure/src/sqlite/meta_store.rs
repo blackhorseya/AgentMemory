@@ -391,12 +391,14 @@ impl TeamRepository for SqliteMetaStore {
     async fn list_teams_of_user(
         &self,
         instance: &InstanceId,
-        user_id: &str,
+        user_id: Option<&str>,
         name: Option<&str>,
         page: Page,
     ) -> DomainResult<(Vec<Team>, usize)> {
         let mut w = Where::default();
-        w.raw("team_id IN (SELECT team_id FROM meta_team_members WHERE user_id = ? AND status = 'active')", [Value::from(user_id.to_owned())]);
+        if let Some(user_id) = user_id {
+            w.raw("team_id IN (SELECT team_id FROM meta_team_members WHERE user_id = ? AND status = 'active')", [Value::from(user_id.to_owned())]);
+        }
         if let Some(n) = name {
             w.raw("name LIKE ?", [Value::from(format!("%{n}%"))]);
         }

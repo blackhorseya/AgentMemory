@@ -40,10 +40,52 @@ export const CORE_V3_ALLOWLIST: ReadonlySet<string> = new Set([
   "meta/team-member/list",
   "meta/agent/list",
   "meta/asset/list-accessible",
+  // administration (system admins only, see ADMIN_ONLY_V3_PATHS)
+  "meta/user/list",
+  "meta/user/create",
+  "meta/user/delete",
+  "meta/user-key/list",
+  "meta/user-key/create",
+  "meta/user-key/revoke",
+  "meta/team/create",
+  "meta/team/update",
+  "meta/team/delete",
+  "meta/team-member/add",
+  "meta/team-member/remove",
+  "meta/agent/create",
+  "meta/agent/update",
+  "meta/agent/delete",
 ]);
 
 /** Paths callable without a verified user key (the login call itself). */
 export const PUBLIC_V3_PATHS: ReadonlySet<string> = new Set(["meta/auth/verify"]);
+
+/**
+ * Every call that changes data or administers the instance. In the panel
+ * only system admins configure; everyone else gets a read-only view. Core
+ * applies its own (finer) rules on top.
+ */
+export const ADMIN_ONLY_V3_PATHS: ReadonlySet<string> = new Set([
+  "conversation/delete",
+  "atomic/update",
+  "atomic/delete",
+  "scenario/write",
+  "core/write",
+  "meta/user/list",
+  "meta/user/create",
+  "meta/user/delete",
+  "meta/user-key/list",
+  "meta/user-key/create",
+  "meta/user-key/revoke",
+  "meta/team/create",
+  "meta/team/update",
+  "meta/team/delete",
+  "meta/team-member/add",
+  "meta/team-member/remove",
+  "meta/agent/create",
+  "meta/agent/update",
+  "meta/agent/delete",
+]);
 
 const SAFE_SEGMENT = /^[a-z0-9-]+$/;
 

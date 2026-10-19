@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+# ──────────────────────────────────────────────────────────────────────
+# Agent Memory upgrade to 0.1.1: run it from the updated checkout of an
+# existing install (the directory holding its .env). It backs up the data,
+# adds new settings to .env, rebuilds and restarts the services, moves the
+# memories written before 0.1.1 (the "default" bucket) to a real team and
+# agent, and prints the user key and `amem login` line for the clients.
+# Every step is safe to repeat. Manual equivalent: docs/UPGRADE.md.
+#
+#   ./upgrade.sh                     interactive
+#   ./upgrade.sh --non-interactive   take answers from the environment
+#   ./upgrade.sh --help
+#
+# Non-interactive variables (all optional):
+#   UPGRADE_ADMIN_NAME   system admin who owns the moved data   (default: oldest admin)
+#   UPGRADE_TEAM_NAME    team receiving it, created if missing   (default default-team)
+#   UPGRADE_AGENT_NAME   agent receiving it, created if missing  (default default-agent-<admin>)
+#   UPGRADE_SKIP_BACKUP  1 to skip the backup (not recommended)
+# ──────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+cd "$(dirname "$0")"
+# shellcheck source=install.sh
+source ./install.sh
+
+BACKUP_ROOT="backups"
+# Settings added since the first release, with the value an old install
+# implicitly used (an exported value wins). Missing ones are appended to .env.
+NEW_SETTINGS=("MEMORY_IMAGE_TAG=${MEMORY_IMAGE_TAG:-local}")
+
+usage() {
+  sed -n '3,19p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+load_env() {
+  [[ -f $ENV_FILE ]] || fail "No $ENV_FILE here. Run this from an existing install, or use ./install.sh for a new one."
+  read_env_file "$ENV_FILE"
+  IFS=, read -r -a PROFILES <<<"${COMPOSE_PROFILES:-}"
+  [[ -n ${AGENT_MEMORY_API_KEY:-} ]] || fail "AGENT_MEMORY_API_KEY is empty in $ENV_FILE; the upgrade needs it."
+  CORE_PORT=${CORE_PORT:-8420}
+  PANEL_PORT=${PANEL_PORT:-8125}
+  INSTANCE=${CORE_INSTANCE_ID:-default}
+}
+
+# ── 1. backup ────────────────────────────────────────────────────────
+
+backup() {
+  if [[ ${UPGRADE_SKIP_BACKUP:-0} == 1 ]]; then
+    warn "Skipping the backup (UPGRADE_SKIP_BACKUP=1)."
+    return
+  fi
+  local stamp old_umask
+  stamp=$(date +%Y%m%d-%H%M%S)
+  BACKUP_DIR="$BACKUP_ROOT/$stamp"
+  old_umask=$(umask)
+  umask 077
+  mkdir -p "$BACKUP_DIR"
+  echo
+  bold "Backing up to $BACKUP_DIR…"
+  cp "$ENV_FILE" "$BACKUP_DIR/env"
+  # The code was updated just before this script ran: the commit before
+  # that checkout is the previous reflog entry.
+  git rev-parse 'HEAD@{1}' >"$BACKUP_DIR/previous-commit" 2>/dev/null || true
+  # Keep the running images under a second tag, so a rollback needs no rebuild.
+  local image tag=${MEMORY_IMAGE_TAG:-local}
+  for image in memory-core memory-panel; do
+    if docker image inspect "$image:$tag" >/dev/null 2>&1; then
+      docker image tag "$image:$tag" "$image:pre-upgrade-$stamp"
+      echo "$image:pre-upgrade-$stamp" >>"$BACKUP_DIR/images"
+    fi
+  done
+  [[ -f $BACKUP_DIR/images ]] && ok "Previous images kept as :pre-upgrade-$stamp"
+
+  case ${AGENT_MEMORY_STORAGE_BACKEND:-sqlite} in
+    postgres)
+      if [[ " ${PROFILES[*]:-} " == *" postgres "* ]]; then
+        docker compose exec -T postgres pg_dump -U "${POSTGRES_USER:-memory}" "${POSTGRES_DB:-memory}" \
+          </dev/null >"$BACKUP_DIR/postgres.sql"
+      else
+        docker run --rm --network host "$PG_CHECK_IMAGE" pg_dump "$AGENT_MEMORY_POSTGRES_URL" \
+          </dev/null >"$BACKUP_DIR/postgres.sql" ||
+          fail "pg_dump of AGENT_MEMORY_POSTGRES_URL failed. Back the database up yourself, then re-run with UPGRADE_SKIP_BACKUP=1."
+      fi
+      ok "Database dumped to $BACKUP_DIR/postgres.sql"
+      ;;
+  esac
+  # memory-core's /data holds the SQLite files, local coordination state
+  # and the L2/L3 profile files on every backend. Stop writers first so the
+  # copies are consistent; start_services brings everything back.
+  docker compose stop memory-core >/dev/null
+  archive_volume memory-core memory-core-data
+  if [[ " ${PROFILES[*]:-} " == *" redis "* ]]; then
+    # Redis runs with appendonly, so archive its whole data directory.
+    docker compose stop redis >/dev/null
+    archive_volume redis redis-data
+  fi
+  umask "$old_umask"
+}
+
+# archive_volume SERVICE NAME — tar the service's /data into the backup.
+# stdin is closed so `compose run` cannot swallow the answers to later prompts.
+archive_volume() {
+  docker compose run --rm --no-deps -T --entrypoint tar "$1" czf - -C /data . </dev/null >"$BACKUP_DIR/$2.tgz"
+  ok "$1 data archived to $BACKUP_DIR/$2.tgz"
+}
+
+# ── 2. settings ──────────────────────────────────────────────────────
+
+add_new_settings() {
+  local setting added=()
+  for setting in "${NEW_SETTINGS[@]}"; do
+    if ! grep -q "^${setting%%=*}=" "$ENV_FILE"; then
+      printf '%s\n' "$setting" >>"$ENV_FILE"
+      export "${setting?}"
+      added+=("$setting")
+    fi
+  done
+  if ((${#added[@]})); then
+    ok "Added to $ENV_FILE: ${added[*]}"
+  else
+    info "$ENV_FILE already has every setting."
+  fi
+}
+
+# ── 3. move the legacy data ──────────────────────────────────────────
+
+# json_field JSON name — first string or number value of "name" (flat fields only)
+json_field() {
+  sed -n "s/.*\"$2\":\"\{0,1\}\([^\",}]*\).*/\1/p" <<<"$1" | head -n 1 | sed 's/^null$//'
+}
+
+core_upgrade() {
+  curl -sS -X POST "http://127.0.0.1:$CORE_PORT/v3/internal/upgrade" \
+    -H "Authorization: Bearer $AGENT_MEMORY_API_KEY" \
+    -H "x-memory-service-id: $INSTANCE" -H "content-type: application/json" \
+    -d "$1"
+}
+
+upgrade_body() {
+  local body="{\"dry_run\":$1,\"issue_key\":$2"
+  [[ -n ${UPGRADE_ADMIN_NAME:-} ]] && body+=",\"admin_username\":\"$UPGRADE_ADMIN_NAME\""
+  [[ -n ${UPGRADE_TEAM_NAME:-} ]] && body+=",\"team_name\":\"$UPGRADE_TEAM_NAME\""
+  [[ -n ${UPGRADE_AGENT_NAME:-} ]] && body+=",\"agent_name\":\"$UPGRADE_AGENT_NAME\""
+  printf '%s}' "$body"
+}
+
+describe_moved() {
+  printf 'conversations %s, memories %s, L2/L3 files %s, skills %s' \
+    "$(json_field "$1" conversations)" "$(json_field "$1" atoms)" \
+    "$(json_field "$1" profile_files)" "$(json_field "$1" skill_versions)"
+}
+
+migrate_legacy() {
+  echo
+  bold "Moving memories written before 0.1.1"
+  local plan
+  plan=$(core_upgrade "$(upgrade_body true false)")
+  if [[ $plan == *'no active system admin'* ]]; then
+    info "This install has no administrator yet; creating one."
+    create_admin
+    plan=$(core_upgrade "$(upgrade_body true false)")
+  fi
+  [[ $plan == *'"code":0'* ]] || fail "Upgrade check failed: $(json_field "$plan" message)"
+
+  local admin team agent
+  admin=$(json_field "$plan" username)
+  ask UPGRADE_TEAM_NAME "Team that receives the old memories" "$(json_field "$plan" team_name)"
+  ask UPGRADE_AGENT_NAME "Agent that receives them (use the name you will give your main client)" \
+    "$(json_field "$plan" agent_name)"
+  UPGRADE_ADMIN_NAME=${UPGRADE_ADMIN_NAME:-$admin}
+  plan=$(core_upgrade "$(upgrade_body true false)")
+  [[ $plan == *'"code":0'* ]] || fail "Upgrade check failed: $(json_field "$plan" message)"
+  team=$(json_field "$plan" team_id)
+  agent=$(json_field "$plan" agent_id)
+  info "Owner : $UPGRADE_ADMIN_NAME"
+  info "Team  : $UPGRADE_TEAM_NAME ${team:-(will be created)}"
+  info "Agent : $UPGRADE_AGENT_NAME ${agent:-(will be created)}"
+  info "Found : $(describe_moved "$plan")"
+  local go
+  ask go "Proceed? (y/n)" y
+  [[ $go =~ ^[Yy] ]] || fail "Stopped before moving anything. Re-run ./upgrade.sh when ready."
+
+  local result
+  result=$(core_upgrade "$(upgrade_body false true)")
+  if [[ $result == *target_has_profile* ]]; then
+    fail "Agent '$UPGRADE_AGENT_NAME' already has L2/L3 memories. Re-run and pick a new agent name."
+  fi
+  [[ $result == *'"code":0'* ]] || fail "Upgrade failed: $(json_field "$result" message)"
+  ok "Moved: $(describe_moved "$result")"
+  TEAM_ID=$(json_field "$result" team_id)
+  AGENT_ID=$(json_field "$result" agent_id)
+  USER_KEY=$(json_field "$result" user_key)
+}
+
+# ── 4. what the clients need ─────────────────────────────────────────
+
+write_client_settings() {
+  CLIENT_FILE="upgrade-client-settings.txt"
+  (
+    umask 077
+    cat >"$CLIENT_FILE" <<EOF
+# Written by upgrade.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ). Contains a user key: keep it private.
+# Replace 127.0.0.1 with this server's address when the client runs elsewhere.
+AMEM_SERVER_URL=http://127.0.0.1:$CORE_PORT
+AMEM_SERVICE_ID=$INSTANCE
+AMEM_TEAM_ID=$TEAM_ID
+AMEM_AGENT_ID=$AGENT_ID
+AMEM_USER_KEY=$USER_KEY
+
+# On each client machine (see docs/REMOTE-CLIENTS.md to install amem):
+#   amem login --server-url http://127.0.0.1:$CORE_PORT --service-id $INSTANCE \\
+#     --team-id $TEAM_ID --agent-id $AGENT_ID --user-key -
+# then paste the key above and press Enter.
+EOF
+  )
+}
+
+print_upgrade_summary() {
+  echo
+  bold "Upgrade complete"
+  info "Monitor Panel : http://localhost:$PANEL_PORT  (log in with the key below)"
+  info "Team / agent  : $TEAM_ID / $AGENT_ID"
+  [[ -n ${BACKUP_DIR:-} ]] && info "Backup        : $BACKUP_DIR  (restore steps: docs/UPGRADE.md)"
+  if [[ -n ${USER_KEY:-} ]]; then
+    echo
+    bold "New user key for $UPGRADE_ADMIN_NAME (also saved in $CLIENT_FILE, mode 600):"
+    info "$USER_KEY"
+  fi
+  echo
+  bold "Next: point each client at the new server"
+  info "amem login --server-url http://127.0.0.1:$CORE_PORT --service-id $INSTANCE --team-id $TEAM_ID --agent-id $AGENT_ID --user-key -"
+  info "Old clients (Bearer key only) stop working now; docs/UPGRADE.md lists what to change for each one."
+}
+
+main_upgrade() {
+  for arg in "$@"; do
+    case $arg in
+      --non-interactive) INTERACTIVE=false ;;
+      -h | --help) usage; exit 0 ;;
+      *) fail "Unknown option: $arg (see --help)" ;;
+    esac
+  done
+
+  bold "Agent Memory upgrade to 0.1.1"
+  require_docker
+  load_env
+  backup
+  add_new_settings
+  start_services
+  migrate_legacy
+  write_client_settings
+  print_upgrade_summary
+}
+
+main_upgrade "$@"

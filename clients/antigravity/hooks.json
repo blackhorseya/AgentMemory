@@ -1,0 +1,12 @@
+{
+  "agent-memory-recall": {
+    "PreInvocation": [
+      { "type": "command", "command": "amem hook antigravity pre-invocation", "timeout": 15 }
+    ]
+  },
+  "agent-memory-capture": {
+    "Stop": [
+      { "type": "command", "command": "amem hook antigravity stop", "timeout": 45 }
+    ]
+  }
+}

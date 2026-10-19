@@ -83,10 +83,11 @@ pub trait TeamRepository: Send + Sync {
     ) -> DomainResult<()>;
     async fn get_team(&self, instance: &InstanceId, team_id: &str) -> DomainResult<Option<Team>>;
     async fn update_team(&self, instance: &InstanceId, team: &Team) -> DomainResult<()>;
+    /// Teams `user_id` is an active member of; `None` lists every team.
     async fn list_teams_of_user(
         &self,
         instance: &InstanceId,
-        user_id: &str,
+        user_id: Option<&str>,
         name: Option<&str>,
         page: Page,
     ) -> DomainResult<(Vec<Team>, usize)>;

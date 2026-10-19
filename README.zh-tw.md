@@ -20,7 +20,7 @@
 
 1. **儲存後端**：SQLite（預設，免安裝）／既有的 PostgreSQL（輸入 URL，先從容器內測試連線）／幫我用 Docker 啟動 PostgreSQL（pgvector）
 2. **協調後端**：單機（預設）／既有的 Redis／幫我用 Docker 啟動 Redis
-3. **LLM**：OpenAI 相容 API／Claude Code CLI／Antigravity CLI
+3. **LLM**：OpenAI 相容 API／Claude Code CLI／Antigravity CLI／Codex CLI
 4. CLI 的專案目錄與對外 port
 
 接著它會產生 Gateway API key 與資料庫密碼、寫入權限 600 的 `.env`（含 `COMPOSE_PROFILES`）、啟動服務並等待健康檢查，最後建立第一位管理員並顯示一次登入用的 user key。
@@ -58,6 +58,18 @@ docker build -t memory-panel:local panel
 docker run --rm -p 8125:8125 -e CORE_URL=http://host.docker.internal:8420 \
   -e CORE_API_KEY=change-me memory-panel:local
 ```
+
+## 使用者、團隊與權限
+
+以 admin 的 user key 登入 Panel。在 **Metadata** 中，系統管理員可以建立使用者（每位都會產生一把 user key，只顯示一次）、建立團隊、把使用者指派到團隊並設定角色，以及建立 Agent。其他使用者看到的是唯讀的 Panel。
+
+Client（任何機器上的 agent）只用自己的 **user key** 驗證，不需要 `AGENT_MEMORY_API_KEY`。每次記憶呼叫都要帶上使用者所屬的 `team_id` 與 `agent_id`；成員只能讀寫自己的記憶。完整規則見 [docs/API.zh-tw.md](docs/API.zh-tw.md)，架構說明見 [docs/ARCHITECTURE.zh-tw.md](docs/ARCHITECTURE.zh-tw.md)。
+
+**伺服器與 agent 在不同機器上？** 請參考 [docs/REMOTE-CLIENTS.zh-tw.md](docs/REMOTE-CLIENTS.zh-tw.md)，內容包含 TLS、發放 key、安裝 `amem` client、Claude Code／Antigravity／Hermes 整合，以及升級時 client 端要做的事。
+
+**從舊版升級？** 更新程式碼後，在安裝目錄執行 `./upgrade.sh`。全手動的步驟與還原方式請見 [docs/UPGRADE.zh-tw.md](docs/UPGRADE.zh-tw.md)。
+
+**移除：** 在跑 agent 的機器上執行 `./uninstall.sh client`，會移除 Claude Code、Codex、Antigravity、Hermes 的整合和 `amem`。在伺服器上執行 `./uninstall.sh server`，會移除容器和映像，但保留資料；加上 `--purge-data` 才會連資料一起刪除。兩者都可以先加 `--dry-run`，看看會移除哪些東西。詳細說明與手動步驟請見 [docs/UNINSTALL.zh-tw.md](docs/UNINSTALL.zh-tw.md)。
 
 ## 本機開發
 
@@ -100,12 +112,19 @@ crates/
 ├── memory-application/     Use cases 與 ports（記憶、召回、管線、元資料、Skill）
 ├── memory-infrastructure/  SQLite / 檔案系統 / OpenAI 客戶端 / 背景 worker
 ├── memory-gateway/         axum v3 HTTP API、信封、驗證、CORS
-└── memory-server/          設定（相容 memory-core.yaml）與組裝（composition root）
+├── memory-server/          設定（相容 memory-core.yaml）與組裝（composition root）
+└── memory-client/          `amem` client：recall／capture hook、secret 過濾、離線佇列、MCP server
+clients/                    Claude Code、Codex、Antigravity 的 plugin，以及 Hermes memory provider
 panel/                      TypeScript Monitor Panel（Hono BFF + React）
 docker/core.Dockerfile      Core 映像（內建 claude 與 agy CLI）
 install.sh                  互動式安裝程式
-docs/ARCHITECTURE.md        架構說明
-docs/API.md                 API 一覽與設計取捨
+upgrade.sh                  將既有安裝升級到 0.1.1
+uninstall.sh                移除 client 或伺服器
+docs/ARCHITECTURE.zh-tw.md  架構說明（含 mermaid 架構圖）
+docs/API.zh-tw.md           API 一覽與設計取捨
+docs/REMOTE-CLIENTS.zh-tw.md  伺服器與 client 分離部署指引
+docs/UPGRADE.zh-tw.md        舊版升級指引（upgrade.sh、手動步驟、還原）
+docs/UNINSTALL.zh-tw.md      移除 client 或伺服器（uninstall.sh、手動步驟）
 ```
 
 ## 設定
@@ -178,24 +197,26 @@ llm:
 
 ### Docker 映像內建的 CLI
 
-`docker/core.Dockerfile` 預設以官方原生安裝腳本（不使用 npm，皆會驗證校驗碼）安裝兩個 CLI，並以非 root 的服務使用者執行：
+`docker/core.Dockerfile` 預設以官方原生安裝腳本（不使用 npm，皆會驗證校驗碼）安裝三個 CLI，並以非 root 的服務使用者執行：
 
 | CLI | 指令 | 建議設定 | 登入方式 |
 | --- | --- | --- | --- |
 | Claude Code | `claude` | `ARGS=-p`、`PROMPT_MODE=stdin` | 設定 `ANTHROPIC_API_KEY`，或執行 `docker compose exec -it memory-core claude` 後輸入 `/login` |
 | Antigravity CLI | `agy` | `ARGS='["-p","{prompt}"]'`、`PROMPT_MODE=arg`（`agy -p` 不讀 stdin） | 執行 `docker compose exec -it memory-core agy`，在瀏覽器開啟顯示的 Google 登入網址 |
+| Codex CLI | `codex` | `ARGS='["exec","--skip-git-repo-check","--ephemeral","-s","read-only","-c","features.hooks=false","-"]'`、`PROMPT_MODE=stdin` | 執行 `docker compose exec -it memory-core codex login --device-auth` 並依畫面指示完成，或把 API key 以 stdin 傳給 `codex login --with-api-key` |
 
-- 登入狀態存放在 named volume（`claude-config` → `~/.claude`、`antigravity-config` → `~/.gemini`），重建容器不會遺失。
+- 登入狀態存放在 named volume（`claude-config` → `~/.claude`、`antigravity-config` → `~/.gemini`、`codex-config` → `~/.codex`），重建容器不會遺失。
 - 專案目錄：以 `PROJECT_DIR` 指定主機路徑，掛載到容器的 `/workspace` 並作為 CLI 的工作目錄。
 - 未登入時，錯誤會出現在 Panel 的 worker 指標（例如 `Not logged in · Please run /login`），管線會重試。
 - `agy` 以參數傳遞 prompt，受 Linux 單一參數 128 KiB 上限限制；超過時會直接回報錯誤。
 - `agy` 需要 CPU 支援 AES-NI（虛擬機請將 CPU 型別設為 host）。
-- 不需要的 CLI 可在建置時略過：`--build-arg INSTALL_CLAUDE=false`、`--build-arg INSTALL_ANTIGRAVITY=false`；Claude Code 版本可用 `--build-arg CLAUDE_VERSION=latest` 或指定版本號。
-- 映像因此約 940 MB；若只用 HTTP API，建議以上述參數略過兩個 CLI。
+- Codex 的參數讓它保持唯讀、不留下 session 檔，並關閉 hooks，避免為 Codex 安裝的記憶 client 把蒸餾用的 prompt 本身寫進記憶。
+- 不需要的 CLI 可在建置時略過：`--build-arg INSTALL_CLAUDE=false`、`--build-arg INSTALL_ANTIGRAVITY=false`、`--build-arg INSTALL_CODEX=false`；Claude Code 版本可用 `--build-arg CLAUDE_VERSION=latest` 或指定版本號。
+- 映像因此約 940 MB；若只用 HTTP API，建議以上述參數略過這些 CLI。
 
 ## 設計取捨
 
-詳見 `docs/API.md`。重點：
+詳見 [docs/API.zh-tw.md](docs/API.zh-tw.md)。重點：
 
 - L2/L3 與 Skill 抽取使用結構化 JSON 操作（而非帶工具的 agentic 迴圈），輸出契約固定、易於測試。
 - 召回與搜尋一律套用租戶隔離；管線游標使用資料庫序號，時間戳相同或補登的訊息不會被跳過。

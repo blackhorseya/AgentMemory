@@ -6,11 +6,13 @@ import { cx } from "../../components/cx";
 import { EmptyState, ErrorBanner, Notice, Spinner } from "../../components/Feedback";
 import { Field, Input, TextArea } from "../../components/Field";
 import { useAction } from "../../hooks/useAction";
+import { useIsAdmin } from "../auth/session";
 import { useAsync } from "../../hooks/useAsync";
 import { formatTime } from "../../lib/format";
 import { buildScenarioTree, type TreeRow } from "./scenarioTree";
 
 export function L2Tab({ scope }: { scope: Scope }) {
+  const admin = useIsAdmin();
   const [selected, setSelected] = useState<string>();
   const [creating, setCreating] = useState(false);
   const listing = useAsync(() => api.scenario.ls(scope), [scope]);
@@ -28,9 +30,11 @@ export function L2Tab({ scope }: { scope: Scope }) {
             <Button size="sm" onClick={() => void listing.reload()}>
               ↻
             </Button>
-            <Button size="sm" onClick={() => (setCreating(true), setSelected(undefined))}>
-              + New
-            </Button>
+            {admin && (
+              <Button size="sm" onClick={() => (setCreating(true), setSelected(undefined))}>
+                + New
+              </Button>
+            )}
           </>
         }
       >
@@ -89,6 +93,7 @@ function TreeItem({ row, active, onSelect }: { row: TreeRow; active: boolean; on
 }
 
 function ScenarioEditor({ scope, path, onSaved }: { scope: Scope; path: string | undefined; onSaved: (path: string) => void }) {
+  const admin = useIsAdmin();
   const file = useAsync(() => api.scenario.read(scope, path ?? ""), [scope, path], !!path);
   const [draftPath, setDraftPath] = useState(path ?? "");
   const [content, setContent] = useState("");
@@ -110,15 +115,17 @@ function ScenarioEditor({ scope, path, onSaved }: { scope: Scope; path: string |
     <Card
       title={path ? <span className="mono normal-case">{path}</span> : "New scenario"}
       actions={
-        <Button
-          size="sm"
-          variant="primary"
-          busy={save.busy}
-          disabled={!draftPath.trim() || draftPath.endsWith("/")}
-          onClick={() => void save.run()}
-        >
-          Save
-        </Button>
+        admin && (
+          <Button
+            size="sm"
+            variant="primary"
+            busy={save.busy}
+            disabled={!draftPath.trim() || draftPath.endsWith("/")}
+            onClick={() => void save.run()}
+          >
+            Save
+          </Button>
+        )
       }
     >
       <div className="space-y-3">

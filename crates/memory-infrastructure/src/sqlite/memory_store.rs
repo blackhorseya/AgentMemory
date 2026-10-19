@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use memory_application::common::{Page, Scored};
 use memory_application::ports::memory::{
     AtomFilter, AtomRepository, AtomSelector, ConversationFilter, ConversationRepository,
-    ProfileFileRepository, Sequenced,
+    MovedRows, ProfileFileRepository, ScopeMigrationStore, Sequenced,
 };
 use memory_domain::error::DomainResult;
 use memory_domain::memory::{AtomType, AtomicMemory, ConversationMessage, Role};
@@ -899,6 +899,61 @@ impl ProfileFileRepository for SqliteMemoryStore {
                     params_from_iter(w.params.iter()),
                     |r| r.get(0),
                 )
+            })
+            .await
+    }
+}
+
+#[async_trait]
+impl ScopeMigrationStore for SqliteMemoryStore {
+    async fn reassign_default(
+        &self,
+        instance: &InstanceId,
+        to: &MemoryScope,
+        dry_run: bool,
+    ) -> DomainResult<MovedRows> {
+        let (team, agent, user) = (
+            to.team_id.to_string(),
+            to.agent_id.to_string(),
+            to.user_id.to_string(),
+        );
+        let d = memory_domain::scope::DEFAULT_BUCKET;
+        self.pool
+            .get(instance)?
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+                let triple = "team_id = ?4 AND agent_id = ?4 AND user_id = ?4";
+                let conversations = tx.execute(
+                    &format!("UPDATE conversations SET team_id = ?1, agent_id = ?2, user_id = ?3 WHERE {triple}"),
+                    params![team, agent, user, d],
+                )?;
+                let atoms = tx.execute(
+                    &format!("UPDATE atoms SET team_id = ?1, agent_id = ?2, user_id = ?3 WHERE {triple}"),
+                    params![team, agent, user, d],
+                )?;
+                let profile_files = tx.execute(
+                    "UPDATE profile_files SET team_id = ?1, agent_id = ?2 WHERE team_id = ?3 AND agent_id = ?3",
+                    params![team, agent, d],
+                )?;
+                let skill_versions = tx.execute(
+                    "UPDATE skills SET team_id = ?1, owner_agent_id = ?2, \
+                     owner_user_id = CASE owner_user_id WHEN ?4 THEN ?3 ELSE owner_user_id END, \
+                     doc = json_set(doc, '$.team_id', ?1, '$.owner_agent_id', ?2, '$.owner_user_id', \
+                                    CASE owner_user_id WHEN ?4 THEN ?3 ELSE owner_user_id END) \
+                     WHERE team_id = ?4 AND owner_agent_id = ?4",
+                    params![team, agent, user, d],
+                )?;
+                // The vec0 index partitions by team; rebuild it from the rows.
+                if atoms > 0 {
+                    vec_index::invalidate(&tx)?;
+                }
+                let moved = MovedRows { conversations, atoms, profile_files, skill_versions };
+                if dry_run {
+                    tx.rollback()?;
+                } else {
+                    tx.commit()?;
+                }
+                Ok(moved)
             })
             .await
     }

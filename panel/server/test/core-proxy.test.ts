@@ -112,6 +112,23 @@ describe("user key guard", () => {
     expect(verifies).toHaveLength(1);
   });
 
+  it("keeps writes and administration to system admins", async () => {
+    const fetchFn = coreFetch(() => jsonResponse(ok({})));
+    const app = buildApp(fetchFn);
+    const viewer = { "x-memory-user-key": "sk-mem-viewer" };
+    for (const path of ["meta/team/create", "meta/team-member/add", "atomic/delete", "core/write"]) {
+      const res = await app.request(`/api/core/${path}`, post("", {}, viewer));
+      expect(res.status, path).toBe(403);
+      expect(await res.json()).toMatchObject({ message: "forbidden: system_admin_required" });
+    }
+    expect(fetchFn.mock.calls.filter(([url]) => !String(url).endsWith("/meta/auth/verify"))).toHaveLength(0);
+
+    const read = await app.request("/api/core/meta/team/list", post("", {}, viewer));
+    expect(read.status).toBe(200);
+    const admin = await app.request("/api/core/meta/team/create", post("", { name: "t" }));
+    expect(admin.status).toBe(200);
+  });
+
   it("can be disabled", async () => {
     const fetchFn = coreFetch(() => jsonResponse(ok({})));
     const res = await buildApp(fetchFn, { requireUserKey: false }).request("/api/core/stats/overview", {

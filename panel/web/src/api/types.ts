@@ -298,6 +298,36 @@ export interface TeamMember {
   username?: string;
 }
 
+export type TeamRole = "admin" | "member" | "reviewer";
+
+export interface UserKeyInfo {
+  key_id: string;
+  user_id: string;
+  /** Masked key value. */
+  key_prefix: string;
+  name?: string | null;
+  status: string;
+  is_default: boolean;
+  last_used_at?: string | null;
+  expires_at?: string | null;
+  created_at: string;
+  /** Only present in the response that created the key. */
+  key_value?: string;
+}
+
+export interface CreatedUser {
+  user_id: string;
+  user_type: UserType;
+  username: string;
+  created_at: string;
+  default_user_key: string;
+}
+
+export interface BatchDeleteResult {
+  deleted_ids: string[];
+  failed: { id: string; reason: string }[];
+}
+
 export interface Agent {
   agent_id: string;
   team_id: string;

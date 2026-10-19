@@ -4,6 +4,8 @@ pub mod admin;
 pub mod common;
 pub mod memory;
 pub mod meta;
+pub mod migration;
 pub mod pipeline;
 pub mod ports;
 pub mod skill;
+pub mod upgrade;

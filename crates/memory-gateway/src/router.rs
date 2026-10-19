@@ -9,7 +9,8 @@ use axum::Router;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
-use crate::context::Ctx;
+use crate::authz;
+use crate::context::{Ctx, USER_KEY, SERVICE_ID};
 use crate::envelope::ApiError;
 use crate::handlers::{memory, meta, ops, skill};
 use crate::state::SharedState;
@@ -64,7 +65,12 @@ fn cors(origins: &[String]) -> Option<CorsLayer> {
         CorsLayer::new()
             .allow_origin(allow)
             .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-            .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]),
+            .allow_headers([
+                header::CONTENT_TYPE,
+                header::AUTHORIZATION,
+                header::HeaderName::from_static(USER_KEY),
+                header::HeaderName::from_static(SERVICE_ID),
+            ]),
     )
 }
 
@@ -149,29 +155,43 @@ fn ops_routes() -> Router<SharedState> {
             "/internal/meta/user/list-by-instance",
             post(meta::internal_list_users),
         )
+        .route(
+            "/internal/migrate/default-scope",
+            post(meta::internal_migrate_default_scope),
+        )
+        .route("/internal/upgrade", post(meta::internal_upgrade))
 }
 
+/// Two trust zones. The memory data plane, skills and session turns are
+/// authorized per user (`x-memory-user-key`, see `authz`), so remote
+/// clients never hold the instance API key. Everything else (ops, metadata,
+/// internal bootstrap) still requires the Bearer key.
 pub fn build_router(state: SharedState) -> Router {
+    let user_auth = || middleware::from_fn_with_state(state.clone(), authz::require_user);
     let session = Router::new()
-        .route("/v3/session/add", post(memory::session_add))
-        .layer(DefaultBodyLimit::max(state.settings.max_session_body_bytes));
-    let v3 = Router::new()
+        .route("/session/add", post(memory::session_add))
+        .layer(DefaultBodyLimit::max(state.settings.max_session_body_bytes))
+        .layer(user_auth());
+    let user_scoped = Router::new()
         .merge(data_plane())
         .nest("/skill", skill_routes())
-        .merge(ops_routes())
-        .layer(DefaultBodyLimit::max(state.settings.max_body_bytes));
-
-    let mut app = Router::new()
-        .route("/health", get(ops::health))
-        .route("/recall", post(ops::legacy_recall))
-        .route("/capture", post(ops::legacy_capture))
-        .nest("/v3", v3)
-        .merge(session)
-        .fallback(not_found)
+        .layer(DefaultBodyLimit::max(state.settings.max_body_bytes))
+        .layer(user_auth());
+    let bearer_scoped = ops_routes()
+        .layer(DefaultBodyLimit::max(state.settings.max_body_bytes))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer,
-        ))
+        ));
+    let v3 = Router::new()
+        .merge(user_scoped)
+        .merge(session)
+        .merge(bearer_scoped);
+
+    let mut app = Router::new()
+        .route("/health", get(ops::health))
+        .nest("/v3", v3)
+        .fallback(not_found)
         .layer(TraceLayer::new_for_http());
     if let Some(cors) = cors(&state.settings.cors_origins) {
         app = app.layer(cors);

@@ -8,13 +8,12 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use memory_application::admin::KnowledgeInput;
 use memory_application::common::Page;
-use memory_application::memory::service::NewMessage;
 use memory_application::pipeline::memory_prompts::{ApplyTarget, PromptAction};
 use memory_application::ports::pipeline::{
     ProfileState, PromptSettingFilter, PromptTarget, SessionState,
 };
-use memory_domain::memory::{Layer, Role};
-use memory_domain::scope::{InstanceId, MemoryScope, SegmentId};
+use memory_domain::memory::Layer;
+use memory_domain::scope::{InstanceId, SegmentId};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -610,84 +609,4 @@ pub async fn instance_destroy(
         &ctx.request_id,
         json!({"instance_id": raw, "cleaned": cleaned}),
     ))
-}
-
-// ── Legacy v1 ───────────────────────────────────────────────────────────
-
-/// v1 calls carry only a session key; they live in the default buckets of
-/// the `x-memory-service-id` instance (or `default`).
-fn legacy_instance(ctx: &Ctx) -> InstanceId {
-    ctx.instance()
-        .unwrap_or_else(|_| SegmentId::default_bucket())
-}
-
-pub async fn legacy_recall(
-    State(s): State<SharedState>,
-    ctx: Ctx,
-    JsonBody(body): JsonBody,
-) -> Response {
-    let query = body
-        .get("query")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if query.is_empty() || body.get("session_key").and_then(Value::as_str).is_none() {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(json!({"error": "query and session_key are required"})),
-        )
-            .into_response();
-    }
-    let scope = MemoryScope::from_optional(None, None, None, None).expect("default scope");
-    match s.services.recall.recall(&legacy_instance(&ctx), &scope, query, None, None).await {
-        Ok(r) => {
-            let context = [r.prepend_context.clone(), r.append_system_context.clone()].into_iter().flatten().collect::<Vec<_>>().join("\n\n");
-            Json(json!({"context": context, "strategy": r.strategy, "memory_count": r.memories.len(), "code": 0, "message": "ok", "retryable": false})).into_response()
-        }
-        Err(e) => Json(json!({"context": "", "memory_count": 0, "code": 20002, "message": e.to_string(), "retryable": true})).into_response(),
-    }
-}
-
-pub async fn legacy_capture(
-    State(s): State<SharedState>,
-    ctx: Ctx,
-    JsonBody(body): JsonBody,
-) -> Response {
-    let field = |k: &str| body.get(k).and_then(Value::as_str).map(str::to_owned);
-    let (Some(user), Some(assistant), Some(session_key)) = (
-        field("user_content"),
-        field("assistant_content"),
-        field("session_key"),
-    ) else {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(json!({"error": "user_content, assistant_content and session_key are required"})),
-        )
-            .into_response();
-    };
-    let session = field("session_id").unwrap_or(session_key);
-    let scope = MemoryScope::from_optional(None, None, None, None).expect("default scope");
-    let messages = [(Role::User, user), (Role::Assistant, assistant)]
-        .into_iter()
-        .map(|(role, content)| NewMessage {
-            role,
-            content,
-            timestamp: None,
-            recorded_at: None,
-        })
-        .collect();
-    match s
-        .services
-        .memory
-        .add_conversation(&legacy_instance(&ctx), &scope, &session, messages)
-        .await
-    {
-        Ok(stored) => {
-            Json(json!({"l0_recorded": stored.len(), "scheduler_notified": true})).into_response()
-        }
-        Err(e) => (
-            crate::envelope::status_for(e.kind),
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
-    }
 }

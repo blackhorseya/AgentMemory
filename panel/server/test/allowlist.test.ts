@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CORE_V3_ALLOWLIST, resolveV3Path } from "../src/http/allowlist.js";
+import { ADMIN_ONLY_V3_PATHS, CORE_V3_ALLOWLIST, resolveV3Path } from "../src/http/allowlist.js";
 
 describe("resolveV3Path", () => {
   it("accepts allowlisted paths", () => {
@@ -15,7 +15,7 @@ describe("resolveV3Path", () => {
   it.each([
     "instance/destroy",
     "internal/meta/user/init-admin",
-    "meta/user/delete",
+    "meta/acl/grant",
     "atomic/../instance/destroy",
     "atomic/query%2f..",
     "ATOMIC/QUERY",
@@ -23,6 +23,10 @@ describe("resolveV3Path", () => {
     "/",
   ])("rejects %j", (tail) => {
     expect(resolveV3Path(tail)).toBeUndefined();
+  });
+
+  it("only guards paths that are allowlisted", () => {
+    for (const path of ADMIN_ONLY_V3_PATHS) expect(CORE_V3_ALLOWLIST.has(path), path).toBe(true);
   });
 
   it("never allowlists destructive admin routes", () => {

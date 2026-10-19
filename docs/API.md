@@ -1,7 +1,10 @@
 # MemoryCore (Rust) HTTP API
 
+[繁體中文](API.zh-tw.md)
+
 RPC-style v3 API. This file lists every implemented endpoint and the
-response conventions.
+response conventions. For how the pieces fit together (trust zones,
+authorization flow, pipeline) see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Conventions
 
@@ -9,17 +12,72 @@ response conventions.
 * Envelope: `{ "code": 0, "message": "ok", "request_id": "req-…", "data": … }`.
   HTTP status equals `code` for 4xx/5xx; skill errors use five-digit codes
   (e.g. `40901`) with the matching HTTP status.
-* Headers
-  * `Authorization: Bearer <AGENT_MEMORY_API_KEY>` — required on every route
-    except `GET /health` when an API key is configured.
-  * `x-memory-service-id: <instance id>` — required on every `/v3/*` route
-    except `/v3/instance/destroy` and `/v3/internal/meta/upstream/*`.
-  * `x-memory-user-key: sk-mem-…` — required on `/v3/meta/*`
+* Two trust zones:
+  * **User-scoped** — the data plane (L0–L3, `recall`, `session/add`) and
+    `/v3/skill/*`. Authorized by `x-memory-user-key` alone; no Bearer key is
+    needed, so remote clients never hold the instance API key.
+  * **Bearer-scoped** — everything else (pipeline/stats, logs, prompts,
+    knowledge, `meta/*`, `internal/*`, `instance/destroy`):
+    `Authorization: Bearer <AGENT_MEMORY_API_KEY>` when an API key is
+    configured. `/v3/meta/*` additionally needs `x-memory-user-key`
     (except `/v3/meta/auth/verify`).
-  * Isolation: `team_id`/`agent_id`/`user_id`/`task_id`/`session_id` in the
-    body, or `x-memory-team-id` / `x-memory-agent-id` / `x-memory-user-id` /
-    `x-memory-task-id` / `x-memory-session-id`. Body wins. Missing ⇒ `default`.
+* `x-memory-service-id: <instance id>` — required on every `/v3/*` route
+  except `/v3/instance/destroy`. Installs use `default`.
+* Isolation: `team_id`/`agent_id`/`user_id`/`task_id`/`session_id` in the
+  body, or `x-memory-team-id` / `x-memory-agent-id` / … headers. Body wins.
+* Data-plane authorization (`crates/memory-domain/src/meta/memory_access.rs`):
+  * `team_id` and `agent_id` are required (there is no `default` bucket);
+    the agent must belong to the team. Missing ⇒ 400, mismatch ⇒ 403.
+  * `user_id` defaults to the caller. Members may read and write only their
+    own memory; only system admins may name another user.
+  * The caller must be an active member of the team (system admins excepted).
+  * The resolved scope is written back into the body and headers before the
+    handler runs, so handlers only ever see an authorized scope.
 * Pagination: `limit` (default 20, max 100) and `offset`.
+
+### Errors
+
+The HTTP status equals `code` in the envelope; `message` explains.
+
+| Status | When |
+| --- | --- |
+| 400 | Invalid JSON or input; `team_id` / `agent_id` missing on the data plane |
+| 401 | Missing or wrong Bearer key; unknown, revoked or expired user key |
+| 403 | Not an active member of the team; agent of another team; naming another `user_id` without being a system admin; metadata action not allowed |
+| 404 | Unknown route or entity |
+| 409 | Conflict, e.g. `already_initialized`, `target_has_profile` |
+| 413 | Body over `max_body_bytes` (`max_session_body_bytes` for `session/add`) |
+| 429 | Quota exceeded |
+| 503 | A dependency (LLM, database) is unavailable |
+
+Skill errors use five-digit codes with the matching HTTP status, e.g. `40301` not owner, `40401` not found, `40901` stale version, `41301` too large.
+
+## Client quick start
+
+What `amem` sends, as plain HTTP. Every data-plane call carries the user key, the instance id, and the team and agent (in the body or as `x-memory-team-id` / `x-memory-agent-id` headers):
+
+```bash
+H=(-H "x-memory-user-key: sk-mem-…" -H "x-memory-service-id: default" -H "content-type: application/json")
+
+# recall before a turn
+curl -sS -X POST https://memory.example.com/v3/recall "${H[@]}" \
+  -d '{"team_id":"team-…","agent_id":"agt-…","query":"release plan","max_results":8}'
+
+# capture the text of a finished turn (→ L0, then L1–L3 in the background)
+curl -sS -X POST https://memory.example.com/v3/conversation/add "${H[@]}" \
+  -d '{"team_id":"team-…","agent_id":"agt-…","session_id":"s-1",
+       "messages":[{"role":"user","content":"…"},{"role":"assistant","content":"…"}]}'
+
+# the same turn with tool calls (→ skill buffer, distilled into skills)
+curl -sS -X POST https://memory.example.com/v3/skill/conversation/add "${H[@]}" \
+  -d '{"team_id":"team-…","agent_id":"agt-…","session_id":"s-1",
+       "messages":[{"role":"user","content":"build it"},
+                   {"role":"tool_call","content":"{\"command\":\"cargo build\"}","tool_name":"Bash","tool_call_id":"t1"},
+                   {"role":"tool_result","content":"Finished","tool_name":"Bash","tool_call_id":"t1"},
+                   {"role":"assistant","content":"Done."}]}'
+```
+
+`user_id` is omitted: it defaults to the key's owner. Tool messages need a `tool_call_id` that pairs the call with its result.
 
 ## Endpoints
 
@@ -28,8 +86,8 @@ response conventions.
 | Method | Path | Notes |
 | --- | --- | --- |
 | GET | `/health` | `{status, version, uptime, stores{vectorStore,embeddingService,ftsAvailable,llmConfigured}, services{pipelineWorker, stateBackend}}` |
-| POST | `/v3/pipeline/status` | **Added.** `{worker: WorkerMetrics, queue: {pending, running, dead_letter}, scopes: ScopeState[]}` |
-| POST | `/v3/stats/overview` | **Added.** Layer counts for the instance: `{l0, l1: {total, episodic, persona, instruction}, l2, l3, skills, generation_logs}` |
+| POST | `/v3/pipeline/status` | `{worker: WorkerMetrics, queue: {pending, running, dead_letter}, scopes: ScopeState[]}` |
+| POST | `/v3/stats/overview` | Layer counts for the instance: `{l0, l1: {total, episodic, persona, instruction}, l2, l3, skills, generation_logs}` |
 
 `WorkerMetrics`: `{tasks_enqueued, tasks_completed, tasks_failed, tasks_retried, tasks_dead_lettered, last_task_at, last_error}`.
 `ScopeState`: `{scope, team_id, agent_id, user_id, session_id, conversation_count, warmup_threshold, l1_cursor, l2_pending, last_l1_at, last_l2_at, last_l3_at, memories_since_persona}`.
@@ -38,8 +96,7 @@ response conventions.
 
 | Path | Notes |
 | --- | --- |
-| `/v3/recall` | **Added (v3 form of legacy `/recall`).** Body `{query, max_results?, strategy?}` + isolation. Returns `{strategy, memories: [{id, type, content, score}], prepend_context, append_system_context}` |
-| `/recall`, `/capture` | Legacy v1 compatibility endpoints. |
+| `/v3/recall` | Body `{query, max_results?, strategy?}` + scope. Returns `{strategy, memories: [{id, type, content, score}], prepend_context, append_system_context}`. Integrations inject `prepend_context` and `append_system_context` (persona, scene navigation) as they are |
 
 ### Data plane (L0–L3)
 
@@ -48,7 +105,9 @@ response conventions.
 `/v3/scenario/{ls,read,write,rm,count}`,
 `/v3/core/{read,write,count}`, `/v3/session/add`.
 
-L2/L3 are scoped by team + agent only.
+* `conversation/add` `{session_id, messages: [{role: user|assistant, content, timestamp?}]}` stores L0 and drives the pipeline.
+* `session/add` stores a raw session turn object (needs `x-memory-user-id` and `x-memory-session-id`, which the middleware sets from the resolved scope).
+* L0/L1 are scoped by team + agent + user; L2 (`scenario/*`) and L3 (`core/*`) by team + agent only.
 
 ### Skills
 
@@ -68,7 +127,7 @@ L2/L3 are scoped by team + agent only.
 
 `/v3/meta/user/{create,create-with-key,get,delete,list}`,
 `/v3/meta/user-key/{create,list,get,revoke,update}`,
-`/v3/meta/team/{create,get,update,delete,list}`,
+`/v3/meta/team/{create,get,update,delete,list}` (`list` with `"all": true` lists every team; system admins only),
 `/v3/meta/team-member/{add,remove,list,get}`,
 `/v3/meta/agent/{create,get,update,delete,list,archive}`,
 `/v3/meta/task/{create,get,update,delete,list,archive}`,
@@ -84,8 +143,27 @@ Meta list responses: `{items, total, limit, offset}`.
 
 ### Internal / operations (Bearer only)
 
-`/v3/internal/meta/user/init-admin` → `{user_id, user_key}` (409 if already initialised),
+`/v3/internal/meta/user/init-admin` `{username, user_key?}` → `{user_id, user_key, team_id, agent_id}`
+— first-run bootstrap: a system admin plus `default-team` and `default-agent-<username>`
+(409 `already_initialized` once any user exists),
 `/v3/internal/meta/user/list-by-instance`,
+`/v3/internal/migrate/default-scope` `{team_id, agent_id, user_id, dry_run?}` →
+`{dry_run, to, moved: {conversations, atoms, profile_files, skill_versions}, session_states, profile_states}`
+— upgrade helper that moves data written to the legacy `default` buckets
+(L0/L1 of `default/default/default`, L2/L3 and skills of `default/default`)
+into a real scope, pipeline cursors included. The agent must belong to the
+team, the user must be an active member, and the agent must have no L2/L3
+yet (409 `target_has_profile`, checked only when legacy data remains, so a
+re-run after a successful move is a no-op). `dry_run: true` rolls back and
+only counts.
+`/v3/internal/upgrade` `{admin_username?, team_name?, agent_name?, issue_key?, dry_run?}` →
+`{dry_run, user_id, username, team_id, team_name, team_created, agent_id, agent_name, agent_created, moved, session_states, profile_states, user_key?}`
+— what `upgrade.sh` calls: picks the system admin (default: the oldest),
+finds the team (default `default-team`) and agent (default
+`default-agent-<admin>`) by exact name or creates them, runs the
+default-scope migration into them for that admin and, with `issue_key`,
+returns a new user key once. A dry run creates nothing (`team_id`/`agent_id`
+are `null` when they would be created). Repeatable.
 `/v3/instance/destroy` `{instance_id}`.
 
 ## Design decisions

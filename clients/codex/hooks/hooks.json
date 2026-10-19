@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "amem hook codex user-prompt-submit", "timeout": 15, "additionalContextLimit": 4000 }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          { "type": "command", "command": "amem hook codex post-tool-use", "timeout": 10 }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "amem hook codex stop", "timeout": 45 }
+        ]
+      }
+    ]
+  }
+}

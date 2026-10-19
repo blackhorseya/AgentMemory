@@ -7,6 +7,8 @@ import type {
   AtomicType,
   AtomicUpdateResult,
   AuthVerifyResult,
+  BatchDeleteResult,
+  CreatedUser,
   ConversationItem,
   ConversationQueryResult,
   CoreHealth,
@@ -30,6 +32,9 @@ import type {
   StatsOverview,
   Team,
   TeamMember,
+  TeamRole,
+  UserKeyInfo,
+  UserPublic,
   WriteResult,
 } from "./types";
 
@@ -106,6 +111,32 @@ export function createCoreApi(client: PanelClient) {
       agents: (teamId: string, page: Page = {}) => call<MetaList<Agent>>("meta/agent/list", { team_id: teamId, ...page }),
       accessibleAssets: (userId: string, filter: { team_id?: string; asset_type?: string } & Page = {}) =>
         call<MetaList<Asset>>("meta/asset/list-accessible", { user_id: userId, ...filter }),
+    },
+
+    /** System-admin operations; the BFF refuses them for everyone else. */
+    admin: {
+      allTeams: (page: Page = {}) => call<MetaList<Team>>("meta/team/list", { all: true, ...page }),
+      createTeam: (input: { name: string; owner_user_id: string; description?: string }) => call<Team>("meta/team/create", input),
+      updateTeam: (input: { team_id: string; name?: string; description?: string; status?: string }) =>
+        call<Team>("meta/team/update", input),
+      deleteTeam: (teamId: string) => call<BatchDeleteResult>("meta/team/delete", { team_ids: [teamId] }),
+
+      addMember: (teamId: string, userId: string, role: TeamRole) =>
+        call<TeamMember>("meta/team-member/add", { team_id: teamId, user_id: userId, role }),
+      removeMember: (teamId: string, userId: string) =>
+        call<unknown>("meta/team-member/remove", { team_id: teamId, user_id: userId }),
+
+      createAgent: (input: { team_id: string; owner_user_id: string; name: string; description?: string }) =>
+        call<Agent>("meta/agent/create", input),
+      deleteAgent: (agentId: string) => call<BatchDeleteResult>("meta/agent/delete", { agent_ids: [agentId] }),
+
+      users: (page: Page = {}) => call<MetaList<UserPublic>>("meta/user/list", page),
+      createUser: (username: string) => call<CreatedUser>("meta/user/create", { username }),
+      deleteUser: (userId: string) => call<BatchDeleteResult>("meta/user/delete", { user_ids: [userId] }),
+
+      keys: (userId: string, page: Page = {}) => call<MetaList<UserKeyInfo>>("meta/user-key/list", { user_id: userId, ...page }),
+      createKey: (userId: string, name?: string) => call<UserKeyInfo>("meta/user-key/create", { user_id: userId, name }),
+      revokeKey: (keyId: string) => call<unknown>("meta/user-key/revoke", { key_id: keyId }),
     },
   };
 }

@@ -20,7 +20,7 @@ The installer asks, in order:
 
 1. **Storage backend**: SQLite (default, nothing to install) / existing PostgreSQL (enter a URL; the connection is tested from inside the container first) / start PostgreSQL (pgvector) for me with Docker
 2. **Coordination backend**: single node (default) / existing Redis / start Redis for me with Docker
-3. **LLM**: OpenAI-compatible API / Claude Code CLI / Antigravity CLI
+3. **LLM**: OpenAI-compatible API / Claude Code CLI / Antigravity CLI / Codex CLI
 4. Project directory for the CLI and the exposed ports
 
 It then generates a Gateway API key and database password, writes `.env` with mode 600 (including `COMPOSE_PROFILES`), starts the services and waits for the health checks, and finally creates the first admin and shows a one-time login user key.
@@ -58,6 +58,18 @@ docker build -t memory-panel:local panel
 docker run --rm -p 8125:8125 -e CORE_URL=http://host.docker.internal:8420 \
   -e CORE_API_KEY=change-me memory-panel:local
 ```
+
+## Users, Teams and Access
+
+Sign in to the Panel with the admin user key. Under **Metadata**, a system admin creates users (each gets a user key, shown once), creates teams, assigns users to teams with a role, and creates agents. Everyone else gets a read-only Panel.
+
+Clients (agents on any machine) authenticate with their **user key only**; they never need `AGENT_MEMORY_API_KEY`. Every memory call names a `team_id` and an `agent_id` the user belongs to, and members can only read and write their own memory. See [docs/API.md](docs/API.md) for the exact rules and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how it fits together.
+
+**Server and agents on different machines?** Follow [docs/REMOTE-CLIENTS.md](docs/REMOTE-CLIENTS.md). It covers TLS, issuing keys, installing the `amem` client and the Claude Code, Codex, Antigravity and Hermes integrations, and the client side of an upgrade.
+
+**Upgrading from an earlier version?** Run `./upgrade.sh` in your install directory, after updating the code. [docs/UPGRADE.md](docs/UPGRADE.md) describes the same steps by hand, plus how to roll back.
+
+**Removing it:** `./uninstall.sh client` removes the client from a machine that runs agents: the Claude Code, Codex, Antigravity and Hermes integrations plus `amem`. On the server, `./uninstall.sh server` removes the containers and images and keeps the data; add `--purge-data` to delete the data as well. Add `--dry-run` to either command to see what would be removed first. Details and the manual steps are in [docs/UNINSTALL.md](docs/UNINSTALL.md).
 
 ## Local Development
 
@@ -100,12 +112,19 @@ crates/
 ├── memory-application/     Use cases and ports (memory, recall, pipeline, metadata, Skill)
 ├── memory-infrastructure/  SQLite / filesystem / OpenAI client / background workers
 ├── memory-gateway/         axum v3 HTTP API, envelopes, validation, CORS
-└── memory-server/          Configuration (memory-core.yaml compatible) and wiring (composition root)
+├── memory-server/          Configuration (memory-core.yaml compatible) and wiring (composition root)
+└── memory-client/          `amem` client: recall/capture hooks, redaction, offline queue, MCP server
+clients/                    Claude Code, Codex and Antigravity plugins, Hermes memory provider
 panel/                      TypeScript Monitor Panel (Hono BFF + React)
 docker/core.Dockerfile      Core image (bundles the claude and agy CLIs)
 install.sh                  Interactive installer
-docs/ARCHITECTURE.md        Architecture overview
+upgrade.sh                  Upgrade an existing install to 0.1.1
+uninstall.sh                Remove the client or the server
+docs/ARCHITECTURE.md        Architecture overview (mermaid diagrams)
 docs/API.md                 API reference and design trade-offs
+docs/REMOTE-CLIENTS.md      Server/client split deployment guide
+docs/UPGRADE.md             Upgrading an existing install (upgrade.sh, manual steps, rollback)
+docs/UNINSTALL.md           Removing the client or the server (uninstall.sh, manual steps)
 ```
 
 ## Configuration
@@ -178,24 +197,26 @@ Equivalent environment variables: `AGENT_MEMORY_LLM_PROVIDER=cli`, `AGENT_MEMORY
 
 ### CLIs Bundled in the Docker Image
 
-By default `docker/core.Dockerfile` installs two CLIs with their official native install scripts (no npm; checksums verified), and runs them as a non-root service user:
+By default `docker/core.Dockerfile` installs three CLIs with their official native install scripts (no npm; checksums verified), and runs them as a non-root service user:
 
 | CLI | Command | Recommended settings | Login |
 | --- | --- | --- | --- |
 | Claude Code | `claude` | `ARGS=-p`, `PROMPT_MODE=stdin` | Set `ANTHROPIC_API_KEY`, or run `docker compose exec -it memory-core claude` and enter `/login` |
 | Antigravity CLI | `agy` | `ARGS='["-p","{prompt}"]'`, `PROMPT_MODE=arg` (`agy -p` doesn't read stdin) | Run `docker compose exec -it memory-core agy` and open the displayed Google sign-in URL in a browser |
+| Codex CLI | `codex` | `ARGS='["exec","--skip-git-repo-check","--ephemeral","-s","read-only","-c","features.hooks=false","-"]'`, `PROMPT_MODE=stdin` | Run `docker compose exec -it memory-core codex login --device-auth` and follow the printed steps, or pipe an API key into `codex login --with-api-key` |
 
-- Login state is stored in named volumes (`claude-config` → `~/.claude`, `antigravity-config` → `~/.gemini`), so it survives container rebuilds.
+- Login state is stored in named volumes (`claude-config` → `~/.claude`, `antigravity-config` → `~/.gemini`, `codex-config` → `~/.codex`), so it survives container rebuilds.
 - Project directory: set the host path with `PROJECT_DIR`; it is mounted at `/workspace` in the container and used as the CLI's working directory.
 - When not logged in, the error shows up in the Panel's worker metrics (e.g. `Not logged in · Please run /login`), and the pipeline retries.
 - `agy` receives the prompt as an argument, so it is subject to Linux's 128 KiB single-argument limit; prompts beyond that fail with an error.
 - `agy` requires a CPU with AES-NI (in VMs, set the CPU type to host).
-- Skip CLIs you don't need at build time: `--build-arg INSTALL_CLAUDE=false`, `--build-arg INSTALL_ANTIGRAVITY=false`; pin the Claude Code version with `--build-arg CLAUDE_VERSION=latest` or a specific version number.
-- As a result the image is about 940 MB; if you only use the HTTP API, skip both CLIs with the arguments above.
+- The Codex arguments keep it read-only, leave no session file, and turn hooks off, so a memory client installed for Codex never captures the distillation prompts themselves.
+- Skip CLIs you don't need at build time: `--build-arg INSTALL_CLAUDE=false`, `--build-arg INSTALL_ANTIGRAVITY=false`, `--build-arg INSTALL_CODEX=false`; pin the Claude Code version with `--build-arg CLAUDE_VERSION=latest` or a specific version number.
+- As a result the image is about 940 MB; if you only use the HTTP API, skip the CLIs with the arguments above.
 
 ## Design Trade-offs
 
-See `docs/API.md` for details. Highlights:
+See [docs/API.md](docs/API.md) for details. Highlights:
 
 - L2/L3 and Skill extraction use structured JSON operations (rather than an agentic loop with tools), giving a fixed output contract that is easy to test.
 - Tenant isolation is always applied to recall and search; pipeline cursors use database sequence numbers, so messages with identical timestamps or backfilled messages are never skipped.

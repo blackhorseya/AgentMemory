@@ -174,9 +174,18 @@ pub async fn dispatch(
             .await
             .map_err(e)?),
         ("team", "list") => {
-            let user = subject_user(&s, &ctx, i, &body, &who).await?;
+            let all = body.get("all").and_then(Value::as_bool) == Some(true);
+            if all && !who.is_system_admin {
+                return Err(ctx.err(DomainError::permission_denied(
+                    "system admin required to list all teams",
+                )));
+            }
+            let user = match all {
+                true => None,
+                false => Some(subject_user(&s, &ctx, i, &body, &who).await?),
+            };
             json!(meta
-                .list_teams(i, &user, str_of(&body, "name"), pagination(&ctx, &body)?)
+                .list_teams(i, user.as_deref(), str_of(&body, "name"), pagination(&ctx, &body)?)
                 .await
                 .map_err(e)?)
         }
@@ -506,4 +515,38 @@ pub async fn internal_list_users(
         .await
         .map_err(|e| ctx.err(e))?;
     Ok(ok(&ctx.request_id, page))
+}
+
+/// Upgrade helper: moves the legacy `default` buckets to a real
+/// team/agent/user. `dry_run: true` only reports what would move.
+pub async fn internal_migrate_default_scope(
+    State(s): State<SharedState>,
+    ctx: Ctx,
+    JsonBody(body): JsonBody,
+) -> ApiResult {
+    let instance = ctx.instance()?;
+    let report = s
+        .services
+        .migration
+        .migrate_default(&instance, ctx.parse(&body)?)
+        .await
+        .map_err(|e| ctx.err(e))?;
+    Ok(ok(&ctx.request_id, report))
+}
+
+/// One-step upgrade from a pre-0.1.1 install (see `memory_application::upgrade`):
+/// ensures team and agent, moves the legacy data, optionally issues a key.
+pub async fn internal_upgrade(
+    State(s): State<SharedState>,
+    ctx: Ctx,
+    JsonBody(body): JsonBody,
+) -> ApiResult {
+    let instance = ctx.instance()?;
+    let report = s
+        .services
+        .upgrade
+        .run(&instance, ctx.parse(&body)?)
+        .await
+        .map_err(|e| ctx.err(e))?;
+    Ok(ok(&ctx.request_id, report))
 }

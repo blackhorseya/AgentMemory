@@ -121,11 +121,15 @@ impl MetaService {
         input: CreateAgentInput,
     ) -> DomainResult<Agent> {
         require_non_empty("name", &input.name)?;
-        let member = self
-            .require_member(instance, &input.team_id, caller)
-            .await?;
-        if input.owner_user_id != caller.user_id && !member.is_admin() {
-            return Err(denied("only team admins create agents for others"));
+        if caller.is_system_admin {
+            self.get_team(instance, &input.team_id).await?;
+        } else {
+            let member = self
+                .require_member(instance, &input.team_id, caller)
+                .await?;
+            if input.owner_user_id != caller.user_id && !member.is_admin() {
+                return Err(denied("only team admins create agents for others"));
+            }
         }
         let now = self.now();
         let agent = Agent {

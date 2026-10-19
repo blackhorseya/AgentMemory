@@ -12,7 +12,9 @@ services:
     build:
       context: .
       dockerfile: docker/core.Dockerfile
-    image: memory-core:local
+    # Tag per deployment so building one stack never swaps the image of
+    # another stack on the same Docker host.
+    image: memory-core:${MEMORY_IMAGE_TAG:-local}
     environment:
       AGENT_MEMORY_API_KEY: ${AGENT_MEMORY_API_KEY:?set AGENT_MEMORY_API_KEY in .env}
       AGENT_MEMORY_LLM_PROVIDER: ${AGENT_MEMORY_LLM_PROVIDER:-openai}
@@ -58,12 +60,13 @@ services:
       # CLI logins survive container rebuilds.
       - claude-config:/home/memory/.claude
       - antigravity-config:/home/memory/.gemini
+      - codex-config:/home/memory/.codex
     restart: unless-stopped
 
   memory-panel:
     build:
       context: ./panel
-    image: memory-panel:local
+    image: memory-panel:${MEMORY_IMAGE_TAG:-local}
     environment:
       CORE_URL: http://memory-core:8420
       CORE_API_KEY: ${AGENT_MEMORY_API_KEY}
@@ -114,3 +117,4 @@ volumes:
   postgres-data:
   claude-config:
   antigravity-config:
+  codex-config:

@@ -168,10 +168,12 @@ impl MetaService {
         Ok(result)
     }
 
+    /// `user_id: None` lists every team; the gateway only passes it for
+    /// system admins.
     pub async fn list_teams(
         &self,
         instance: &InstanceId,
-        user_id: &str,
+        user_id: Option<&str>,
         name: Option<&str>,
         pagination: Pagination,
     ) -> DomainResult<MetaPage<Team>> {

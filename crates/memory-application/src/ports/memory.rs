@@ -5,6 +5,7 @@ use memory_domain::error::DomainResult;
 use memory_domain::memory::{AtomType, AtomicMemory, ConversationMessage};
 use memory_domain::profile::{ProfileFile, ProfileScope};
 use memory_domain::scope::{InstanceId, MemoryScope};
+use serde::Serialize;
 
 use crate::common::{Page, Scored, TimeRange};
 
@@ -195,6 +196,30 @@ pub trait ProfileFileRepository: Send + Sync {
         profile: Option<&ProfileScope>,
         prefix: &str,
     ) -> DomainResult<usize>;
+}
+
+/// Rows moved by [`ScopeMigrationStore::reassign_default`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct MovedRows {
+    pub conversations: usize,
+    pub atoms: usize,
+    pub profile_files: usize,
+    pub skill_versions: usize,
+}
+
+/// Upgrade path for data written before the data plane required a real
+/// team and agent: re-homes the `default` buckets in one transaction.
+#[async_trait]
+pub trait ScopeMigrationStore: Send + Sync {
+    /// Moves L0/L1 rows of `default/default/default`, and L2/L3 files and
+    /// skills of team+agent `default/default`, to `to`. With `dry_run` the
+    /// transaction is rolled back and only the counts are reported.
+    async fn reassign_default(
+        &self,
+        instance: &InstanceId,
+        to: &MemoryScope,
+        dry_run: bool,
+    ) -> DomainResult<MovedRows>;
 }
 
 /// Raw session-turn objects written by `/v3/session/add`.

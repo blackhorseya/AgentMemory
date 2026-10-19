@@ -9,6 +9,7 @@ import { Select } from "../../components/Field";
 import { Pager } from "../../components/Pager";
 import { SearchBox } from "../../components/SearchBox";
 import { useAction } from "../../hooks/useAction";
+import { useIsAdmin } from "../auth/session";
 import { useAsync } from "../../hooks/useAsync";
 import { formatTime } from "../../lib/format";
 import { AtomEditor } from "./AtomEditor";
@@ -40,6 +41,7 @@ export function L1Tab({ scope }: { scope: Scope }) {
     await list.reload();
   });
 
+  const admin = useIsAdmin();
   const columns: ReadonlyArray<Column<AtomicDetail>> = [
     { key: "type", header: "Type", render: (a) => <Badge tone={TYPE_TONE[a.type] ?? "neutral"}>{a.type}</Badge> },
     {
@@ -55,11 +57,11 @@ export function L1Tab({ scope }: { scope: Scope }) {
     { key: "version", header: "Ver", render: (a) => <span className="mono">v{String(a.version).replace(/^v/, "")}</span> },
     ...(query ? [{ key: "score", header: "Score", render: (a: AtomicDetail) => <span className="mono">{a.score?.toFixed(3) ?? "—"}</span> }] : []),
     { key: "updated", header: "Updated", render: (a) => <span className="mono whitespace-nowrap text-muted">{formatTime(a.updated_at)}</span> },
-    {
+    ...(admin ? [{
       key: "actions",
       header: "",
       className: "text-right whitespace-nowrap",
-      render: (a) => (
+      render: (a: AtomicDetail) => (
         <div className="flex justify-end gap-1">
           <Button size="sm" onClick={() => setEditing(a)}>
             Edit
@@ -69,7 +71,7 @@ export function L1Tab({ scope }: { scope: Scope }) {
           </Button>
         </div>
       ),
-    },
+    }] : []),
   ];
 
   return (

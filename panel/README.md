@@ -27,7 +27,7 @@ browser ──► panel/server (Hono BFF, :8125) ──► MemoryCore (:8420)
 | Memory browser (team/agent/user scope) | L0 `conversation/{query,search,delete}`<br>L1 `atomic/{query,search,update,delete}`<br>L2 `scenario/{ls,read,write}`<br>L3 `core/{read,write}`<br>Recall test: `recall` |
 | Generation logs | `memory-generation-log/{list,get}` |
 | Skills | `skill/{list,search,get,versions}` |
-| Metadata | `meta/team/list`, `meta/team-member/list`, `meta/agent/list`, `meta/asset/list-accessible` |
+| Metadata: Teams / Users / Assets | Everyone: `meta/team/list`, `meta/team-member/list`, `meta/agent/list`, `meta/asset/list-accessible`<br>System admins: `meta/user/{list,create,delete}`, `meta/user-key/{list,create,revoke}`, `meta/team/{create,update,delete}` (+ `list` with `all`), `meta/team-member/{add,remove}`, `meta/agent/{create,update,delete}` |
 
 ## BFF endpoints
 
@@ -55,7 +55,7 @@ Core responses pass through unchanged. The BFF generates its own errors using Co
 | Core unreachable | 502 | `{"code":502,"message":"CORE_UNAVAILABLE"}` |
 | Missing or invalid user key | 401 | Only when `PANEL_REQUIRE_USER_KEY` is on (the default) |
 
-By default, every proxied call except `meta/auth/verify` needs a user key that Core accepts. Verdicts are cached for 60 s. Without this check, anyone who could reach the panel could use the Core API key it holds.
+By default, every proxied call except `meta/auth/verify` needs a user key that Core accepts. Calls that change data or administer the instance (`ADMIN_ONLY_V3_PATHS` in `server/src/http/allowlist.ts`) also need a `system_admin` key; anyone else gets `403 forbidden: system_admin_required`, and the UI hides those controls. Verdicts are cached for 60 s. Without this check, anyone who could reach the panel could use the Core API key it holds.
 
 ## Configuration
 

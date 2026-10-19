@@ -1,0 +1,38 @@
+{
+  "name": "agent-memory",
+  "displayName": "Agent Memory",
+  "version": "0.1.1",
+  "description": "Long-term memory from a self-hosted Agent Memory server: recalls relevant memories before each prompt and captures each finished turn (tool calls included, secrets redacted).",
+  "author": { "name": "William Chang" },
+  "license": "MIT",
+  "keywords": ["memory", "recall", "self-hosted"],
+  "userConfig": {
+    "server_url": {
+      "type": "string",
+      "title": "Server URL",
+      "description": "Agent Memory server, e.g. https://memory.example.com. Leave empty to use `amem login`."
+    },
+    "user_key": {
+      "type": "string",
+      "title": "User key",
+      "description": "Your sk-mem-… user key from the Memory Panel. Leave empty to use `amem login`.",
+      "sensitive": true
+    },
+    "team_id": {
+      "type": "string",
+      "title": "Team ID",
+      "description": "team_… of a team you belong to. Leave empty to use `amem login`."
+    },
+    "agent_id": {
+      "type": "string",
+      "title": "Agent ID",
+      "description": "agt_… of an agent in that team. Leave empty to use `amem login`."
+    },
+    "service_id": {
+      "type": "string",
+      "title": "Service ID",
+      "description": "Memory instance (x-memory-service-id).",
+      "default": "default"
+    }
+  }
+}

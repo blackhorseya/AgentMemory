@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { EmptyState } from "../../components/Feedback";
 import { PageHeader } from "../../components/PageHeader";
 import { Tabs, type TabItem } from "../../components/Tabs";
 import { useStore } from "../../hooks/useStore";
@@ -7,7 +8,7 @@ import { L1Tab } from "./L1Tab";
 import { L2Tab } from "./L2Tab";
 import { L3Tab } from "./L3Tab";
 import { RecallPanel } from "./RecallPanel";
-import { scopeKey, scopeStore } from "./scope";
+import { isComplete, scopeKey, scopeStore } from "./scope";
 import { ScopePicker } from "./ScopePicker";
 
 type TabId = "l0" | "l1" | "l2" | "l3" | "recall";
@@ -28,12 +29,18 @@ export function MemoryPage() {
     <div className="space-y-4">
       <PageHeader title="Memory browser" subtitle={<span className="mono">scope {scopeKey(scope)}</span>} />
       <ScopePicker value={scope} onChange={scopeStore.set} />
-      <Tabs items={TABS} value={tab} onChange={setTab} />
-      {tab === "l0" && <L0Tab scope={scope} />}
-      {tab === "l1" && <L1Tab scope={scope} />}
-      {tab === "l2" && <L2Tab scope={scope} />}
-      {tab === "l3" && <L3Tab scope={scope} />}
-      {tab === "recall" && <RecallPanel scope={scope} />}
+      {isComplete(scope) ? (
+        <>
+          <Tabs items={TABS} value={tab} onChange={setTab} />
+          {tab === "l0" && <L0Tab scope={scope} />}
+          {tab === "l1" && <L1Tab scope={scope} />}
+          {tab === "l2" && <L2Tab scope={scope} />}
+          {tab === "l3" && <L3Tab scope={scope} />}
+          {tab === "recall" && <RecallPanel scope={scope} />}
+        </>
+      ) : (
+        <EmptyState>Pick a team and an agent, then apply the scope.</EmptyState>
+      )}
     </div>
   );
 }

@@ -3,7 +3,7 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { UserKeyVerifier } from "../../auth/user-key-verifier.js";
 import type { CoreClient, CoreResponse } from "../../core-client/port.js";
 import type { AppEnv } from "../app-env.js";
-import { PUBLIC_V3_PATHS, resolveV3Path } from "../allowlist.js";
+import { ADMIN_ONLY_V3_PATHS, PUBLIC_V3_PATHS, resolveV3Path } from "../allowlist.js";
 import { errorEnvelope, PanelErrors } from "../envelope.js";
 
 export interface CoreProxyDeps {
@@ -33,7 +33,7 @@ export function coreProxyRoutes(deps: CoreProxyDeps): Hono<AppEnv> {
 
     const userKey = c.req.header("x-memory-user-key")?.trim() || undefined;
     const denied = await checkUserKey(deps.verifier, path, userKey, requestId);
-    if (denied) return c.json(errorEnvelope(401, denied, requestId), 401);
+    if (denied) return c.json(errorEnvelope(denied.status, denied.message, requestId), denied.status);
 
     const response = await deps.core.callV3(path, body, { requestId, userKey });
     return relay(c, response);
@@ -47,11 +47,15 @@ async function checkUserKey(
   path: string,
   userKey: string | undefined,
   requestId: string,
-): Promise<string | undefined> {
+): Promise<{ status: 401 | 403; message: string } | undefined> {
   if (!verifier || PUBLIC_V3_PATHS.has(path)) return undefined;
-  if (!userKey) return PanelErrors.MISSING_USER_KEY;
+  if (!userKey) return { status: 401, message: PanelErrors.MISSING_USER_KEY };
   const user = await verifier.verify(userKey, requestId);
-  return user ? undefined : PanelErrors.UNAUTHORIZED;
+  if (!user) return { status: 401, message: PanelErrors.UNAUTHORIZED };
+  if (ADMIN_ONLY_V3_PATHS.has(path) && user.user_type !== "system_admin") {
+    return { status: 403, message: PanelErrors.ADMIN_ONLY };
+  }
+  return undefined;
 }
 
 const INVALID_JSON = Symbol("invalid-json");

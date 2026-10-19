@@ -1,5 +1,6 @@
 //! Interface adapters: the v3 HTTP API over the application use cases.
 
+pub mod authz;
 pub mod context;
 pub mod envelope;
 pub mod handlers;

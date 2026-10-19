@@ -10,6 +10,8 @@ use memory_application::memory::recall::RecallService;
 use memory_application::memory::service::MemoryService;
 use memory_application::memory::session::SessionService;
 use memory_application::meta::MetaService;
+use memory_application::migration::LegacyScopeMigration;
+use memory_application::upgrade::LegacyUpgrade;
 use memory_application::pipeline::generation_logs::GenerationLogService;
 use memory_application::pipeline::memory_prompts::MemoryPromptService;
 use memory_application::pipeline::service::PipelineService;
@@ -18,7 +20,8 @@ use memory_application::skill::service::SkillService;
 
 #[derive(Debug, Clone)]
 pub struct GatewaySettings {
-    /// Bearer token required on every route but `/health` (None = open).
+    /// Bearer token required on ops, metadata and internal routes (None =
+    /// open). The data plane is authorized by user key instead.
     pub api_key: Option<String>,
     pub cors_origins: Vec<String>,
     pub max_body_bytes: usize,
@@ -51,6 +54,8 @@ pub struct Services {
     pub skills: Arc<SkillService>,
     pub skill_extraction: Arc<SkillExtractionService>,
     pub lifecycle: Arc<dyn InstanceLifecycle>,
+    pub migration: Arc<LegacyScopeMigration>,
+    pub upgrade: Arc<LegacyUpgrade>,
 }
 
 pub struct AppState {

@@ -57,20 +57,60 @@ struct Client {
     base: String,
     /// `x-memory-service-id` of every call.
     instance: String,
+    /// Set by `bootstrap`: the admin, plus a plain member whose key `call`
+    /// sends and whose team/agent/user `scoped` fills in.
+    admin_key: String,
+    member_key: String,
+    team_id: String,
+    agent_id: String,
+    user_id: String,
+    /// In-process access, for seeding data the HTTP API no longer accepts.
+    state: memory_gateway::SharedState,
 }
 
 impl Client {
     async fn call(&self, path: &str, body: Value) -> Value {
-        let res = self
-            .http
-            .post(format!("{}{path}", self.base))
-            .bearer_auth("test-key")
-            .header("x-memory-service-id", &self.instance)
-            .json(&body)
-            .send()
-            .await
-            .unwrap();
-        res.json().await.unwrap()
+        self.call_as(path, &self.member_key, body).await
+    }
+
+    fn scoped(&self, mut body: Value) -> Value {
+        body["team_id"] = json!(self.team_id);
+        body["agent_id"] = json!(self.agent_id);
+        body["user_id"] = json!(self.user_id);
+        body
+    }
+
+    /// Creates the admin (with its default team and agent) and a member of
+    /// that team, then makes the member the default caller.
+    async fn bootstrap(&mut self) {
+        let admin = self
+            .call_as("/v3/internal/meta/user/init-admin", "", json!({"username": "admin"}))
+            .await["data"]
+            .clone();
+        self.admin_key = admin["user_key"].as_str().unwrap().to_owned();
+        self.team_id = admin["team_id"].as_str().unwrap().to_owned();
+        self.agent_id = admin["agent_id"].as_str().unwrap().to_owned();
+        let member = self.create_member("user-e2e").await;
+        self.user_id = member.0;
+        self.member_key = member.1;
+    }
+
+    /// Creates a user, adds it to the bootstrap team, returns (id, key).
+    async fn create_member(&self, username: &str) -> (String, String) {
+        let user = self
+            .call_as("/v3/meta/user/create", &self.admin_key, json!({"username": username}))
+            .await["data"]
+            .clone();
+        let user_id = user["user_id"].as_str().unwrap().to_owned();
+        let added = self
+            .call_as(
+                "/v3/meta/team-member/add",
+                &self.admin_key,
+                json!({"team_id": self.team_id, "user_id": user_id}),
+            )
+            .await;
+        assert_eq!(added["code"], 0, "{added}");
+        (user_id, user["default_user_key"].as_str().unwrap().to_owned())
     }
 
     /// Polls `stats/overview` until `pred` holds.
@@ -112,23 +152,24 @@ async fn start_with(configure: impl FnOnce(&mut Config)) -> (tempfile::TempDir, 
         app.state.clone(),
         std::future::pending(),
     ));
-    (
-        data,
-        Client {
-            http: reqwest::Client::new(),
-            base,
-            instance: "ins-e2e".into(),
-        },
-    )
-}
-
-const SCOPE: (&str, &str, &str) = ("team-e2e", "agent-e2e", "user-e2e");
-
-fn scoped(mut body: Value) -> Value {
-    body["team_id"] = json!(SCOPE.0);
-    body["agent_id"] = json!(SCOPE.1);
-    body["user_id"] = json!(SCOPE.2);
-    body
+    // Unique per run: on Postgres instances outlive the test process.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let mut client = Client {
+        http: reqwest::Client::new(),
+        base,
+        instance: format!("ins-e2e-{}-{nanos}", std::process::id()),
+        admin_key: String::new(),
+        member_key: String::new(),
+        team_id: String::new(),
+        agent_id: String::new(),
+        user_id: String::new(),
+        state: app.state.clone(),
+    };
+    client.bootstrap().await;
+    (data, client)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -169,19 +210,13 @@ async fn the_pipeline_runs_on_the_postgres_backend() {
         return;
     };
     let base_url = spawn_fake_llm().await;
-    let (_data, mut client) = start_with(|config| {
+    let (_data, client) = start_with(|config| {
         config.llm.base_url = base_url;
         config.llm.api_key = "fake".into();
         config.storage.backend = "postgres".into();
         config.storage.postgres.url = url;
     })
     .await;
-    // The database outlives the test; a fresh instance keeps runs apart.
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    client.instance = format!("ins-e2e-pg-{}-{nanos}", std::process::id());
 
     let health: Value = client
         .http
@@ -223,7 +258,7 @@ async fn assert_conversation_is_distilled(client: &Client) {
     let added = client
         .call(
             "/v3/conversation/add",
-            scoped(json!({"session_id": "s1", "messages": [
+            client.scoped(json!({"session_id": "s1", "messages": [
                 {"role": "user", "content": "We release v2 next Monday; I always run integration tests first."},
                 {"role": "assistant", "content": "Noted, I will remind you."}
             ]})),
@@ -246,11 +281,11 @@ async fn assert_conversation_is_distilled(client: &Client) {
         "low-priority memory must be dropped: {stats}"
     );
 
-    let scenes = client.call("/v3/scenario/ls", scoped(json!({}))).await;
+    let scenes = client.call("/v3/scenario/ls", client.scoped(json!({}))).await;
     assert_eq!(scenes["data"]["entries"][0]["path"], "Release-Planning.md");
     assert_eq!(scenes["data"]["entries"][0]["heat"], 1);
 
-    let persona = client.call("/v3/core/read", scoped(json!({}))).await;
+    let persona = client.call("/v3/core/read", client.scoped(json!({}))).await;
     let content = persona["data"]["content"].as_str().unwrap();
     assert!(content.starts_with("# User Narrative Profile"), "{content}");
     assert!(content.contains("Scene Navigation"));
@@ -258,7 +293,7 @@ async fn assert_conversation_is_distilled(client: &Client) {
     let recall = client
         .call(
             "/v3/recall",
-            scoped(json!({"query": "when is the v2 release?"})),
+            client.scoped(json!({"query": "when is the v2 release?"})),
         )
         .await;
     let memories = recall["data"]["memories"].as_array().unwrap();
@@ -273,14 +308,23 @@ async fn assert_conversation_is_distilled(client: &Client) {
         .unwrap()
         .contains("<user-persona>"));
 
-    // Isolation: another user of the same agent shares L2/L3 but not L1.
-    let other = client
+    // Isolation: a member cannot even ask for another user's L1, and that
+    // user (seen through the admin) shares L2/L3 but not L1.
+    let peek = client
         .call(
             "/v3/atomic/query",
-            json!({"team_id": SCOPE.0, "agent_id": SCOPE.1, "user_id": "someone-else"}),
+            json!({"team_id": client.team_id, "agent_id": client.agent_id, "user_id": "someone-else"}),
         )
         .await;
-    assert_eq!(other["data"]["total"], 0);
+    assert_eq!(peek["code"], 403, "{peek}");
+    let other = client
+        .call_as(
+            "/v3/atomic/query",
+            &client.admin_key,
+            json!({"team_id": client.team_id, "agent_id": client.agent_id, "user_id": "someone-else"}),
+        )
+        .await;
+    assert_eq!(other["data"]["total"], 0, "{other}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -301,14 +345,14 @@ async fn assert_tool_calls_become_a_skill(client: &Client) {
     let result = client
         .call(
             "/v3/skill/conversation/add",
-            scoped(json!({"session_id": "s-skill", "messages": tool_calls})),
+            client.scoped(json!({"session_id": "s-skill", "messages": tool_calls})),
         )
         .await;
     assert_eq!(result["data"]["status"], "archived", "{result}");
     assert_eq!(result["data"]["archived"]["reason"], "tool_calls");
 
     client.wait_for(|s| s["skills"] == 1).await;
-    let listing = client.call("/v3/skill/listing", scoped(json!({}))).await;
+    let listing = client.call("/v3/skill/listing", client.scoped(json!({}))).await;
     assert!(
         listing["data"]["listing"]
             .as_str()
@@ -339,44 +383,33 @@ async fn requests_without_bearer_token_are_rejected() {
 }
 
 impl Client {
+    /// Sends the Bearer key and, unless empty, `user_key`.
     async fn call_as(&self, path: &str, user_key: &str, body: Value) -> Value {
-        self.http
+        let mut req = self
+            .http
             .post(format!("{}{path}", self.base))
             .bearer_auth("test-key")
-            .header("x-memory-service-id", &self.instance)
-            .header("x-memory-user-key", user_key)
-            .json(&body)
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap()
+            .header("x-memory-service-id", &self.instance);
+        if !user_key.is_empty() {
+            req = req.header("x-memory-user-key", user_key);
+        }
+        req.json(&body).send().await.unwrap().json().await.unwrap()
     }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn other_users_cannot_read_or_change_foreign_data() {
     let (_data, client) = start().await;
-    let admin = client
-        .call(
-            "/v3/internal/meta/user/init-admin",
-            json!({"username": "admin"}),
-        )
-        .await["data"]
-        .clone();
-    let admin_key = admin["user_key"].as_str().unwrap();
-    let team = admin["team_id"].as_str().unwrap();
-    let agent = admin["agent_id"].as_str().unwrap();
+    let (admin_key, team, agent) = (&client.admin_key, &client.team_id, &client.agent_id);
     let outsider = client
-        .call_as(
-            "/v3/meta/user/create",
-            admin_key,
-            json!({"username": "mallory"}),
-        )
+        .call_as("/v3/meta/user/create", admin_key, json!({"username": "mallory"}))
         .await["data"]
         .clone();
     let mallory_key = outsider["default_user_key"].as_str().unwrap();
+    let admin_id = client
+        .call_as("/v3/meta/auth/verify", "", json!({"user_key": admin_key}))
+        .await["data"]["user"]["user_id"]
+        .clone();
 
     let team_read = client
         .call_as("/v3/meta/team/get", mallory_key, json!({"team_id": team}))
@@ -389,7 +422,7 @@ async fn other_users_cannot_read_or_change_foreign_data() {
         .call_as(
             "/v3/meta/asset/list-accessible",
             mallory_key,
-            json!({"user_id": admin["user_id"]}),
+            json!({"user_id": admin_id}),
         )
         .await;
     assert_eq!(
@@ -406,31 +439,65 @@ async fn other_users_cannot_read_or_change_foreign_data() {
     assert_eq!(loadout["code"], 403, "{loadout}");
 
     let skill = client
-        .call(
+        .call_as(
             "/v3/skill/create",
-            json!({"team_id": team, "agent_id": agent, "user_id": admin["user_id"], "name": "secret-runbook",
+            admin_key,
+            json!({"team_id": team, "agent_id": agent, "name": "secret-runbook",
                    "content": "---\nname: secret-runbook\ndescription: internal\n---\nsteps"}),
         )
-        .await["data"]
-        .clone();
-    let skill_id = skill["skill_id"].as_str().unwrap();
-    let anonymous_write = client
-        .call(
-            "/v3/skill/update",
-            json!({"skill_id": skill_id, "expected_version": 1, "content": "x"}),
-        )
         .await;
-    assert_eq!(
-        anonymous_write["code"], 40001,
-        "writes need a full identity: {anonymous_write}"
-    );
+    let skill_id = skill["data"]["skill_id"].as_str().unwrap();
     let foreign_read = client
-        .call(
+        .call_as(
             "/v3/skill/get",
-            json!({"skill_id": skill_id, "team_id": "another-team"}),
+            mallory_key,
+            json!({"skill_id": skill_id, "team_id": team, "agent_id": agent}),
         )
         .await;
-    assert_eq!(foreign_read["code"], 40401, "{foreign_read}");
+    assert_eq!(foreign_read["code"], 403, "{foreign_read}");
+    let memory_read = client
+        .call_as("/v3/recall", mallory_key, json!({"team_id": team, "agent_id": agent, "query": "x"}))
+        .await;
+    assert_eq!(memory_read["code"], 403, "{memory_read}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_data_plane_is_authorized_by_user_key_alone() {
+    let (_data, client) = start().await;
+    let post = |path: &str| {
+        client
+            .http
+            .post(format!("{}{path}", client.base))
+            .header("x-memory-service-id", &client.instance)
+    };
+    let anonymous = post("/v3/recall")
+        .json(&client.scoped(json!({"query": "x"})))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), 401, "a user key is required");
+
+    // No Bearer key: remote clients only hold their own user key.
+    let recall: Value = post("/v3/recall")
+        .header("x-memory-user-key", &client.member_key)
+        .json(&json!({"team_id": client.team_id, "agent_id": client.agent_id, "query": "x"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(recall["code"], 0, "user_id defaults to the caller: {recall}");
+
+    let no_team = client.call("/v3/recall", json!({"agent_id": client.agent_id, "query": "x"})).await;
+    assert_eq!(no_team["code"], 400, "there is no default team bucket: {no_team}");
+    let unknown_agent = client
+        .call("/v3/recall", json!({"team_id": client.team_id, "agent_id": "nope", "query": "x"}))
+        .await;
+    assert_eq!(unknown_agent["code"], 403, "{unknown_agent}");
+    for gone in ["/recall", "/capture"] {
+        assert_eq!(post(gone).send().await.unwrap().status(), 404, "{gone}");
+    }
 }
 
 /// A stand-in for a local LLM CLI (`claude -p`, `ollama run` …): reads the
@@ -471,7 +538,7 @@ async fn a_local_cli_can_serve_as_the_llm() {
     client
         .call(
             "/v3/conversation/add",
-            scoped(json!({"session_id": "s-cli", "messages": [{"role": "user", "content": "We release v2 next Monday."}]})),
+            client.scoped(json!({"session_id": "s-cli", "messages": [{"role": "user", "content": "We release v2 next Monday."}]})),
         )
         .await;
     client
@@ -483,4 +550,248 @@ async fn a_local_cli_can_serve_as_the_llm() {
         std::fs::canonicalize(project.path()).unwrap(),
         "the CLI must run in the configured project directory"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_system_admin_manages_teams_it_does_not_belong_to() {
+    let (_data, client) = start().await;
+    let admin = &client.admin_key;
+    let (alice, alice_key) = client.create_member("alice").await;
+    let team = client
+        .call_as(
+            "/v3/meta/team/create",
+            admin,
+            json!({"name": "research", "owner_user_id": alice}),
+        )
+        .await["data"]["team_id"]
+        .clone();
+    let agent = client
+        .call_as(
+            "/v3/meta/agent/create",
+            admin,
+            json!({"team_id": team, "owner_user_id": alice, "name": "claude-code"}),
+        )
+        .await;
+    assert_eq!(agent["code"], 0, "admins need no membership: {agent}");
+
+    let all = client
+        .call_as("/v3/meta/team/list", admin, json!({"all": true}))
+        .await;
+    assert_eq!(all["data"]["total"], 2, "bootstrap team + research: {all}");
+    let refused = client
+        .call_as("/v3/meta/team/list", &alice_key, json!({"all": true}))
+        .await;
+    assert_eq!(refused["code"], 403, "{refused}");
+
+    let recall = client
+        .call_as(
+            "/v3/recall",
+            &alice_key,
+            json!({"team_id": team, "agent_id": agent["data"]["agent_id"], "query": "x"}),
+        )
+        .await;
+    assert_eq!(recall["code"], 0, "the owner is a member of the new team: {recall}");
+}
+
+/// The `amem` client against a live server: redaction, both capture
+/// requests and the offline queue.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_amem_client_redacts_queues_and_delivers() {
+    use memory_client::{api::Api, capture::capture, config::Config, queue::Queue, transcript::Msg};
+
+    let (_data, client) = start().await;
+    let queue_dir = tempfile::tempdir().unwrap();
+    let cfg = Config {
+        server_url: client.base.clone(),
+        service_id: client.instance.clone(),
+        user_key: client.member_key.clone(),
+        team_id: client.team_id.clone(),
+        agent_id: client.agent_id.clone(),
+    };
+    let msg = |role: &'static str, content: &str| Msg { role, content: content.into(), tool_name: Some("shell".into()), tool_call_id: Some("c1".into()) };
+    let turn = vec![
+        Msg { tool_name: None, tool_call_id: None, ..msg("user", "We release v2 next Monday. My key is sk-ant-api03-abcdefghijklmnopqrstuvwxyz") },
+        msg("tool_call", r#"{"command":"ls"}"#),
+        msg("tool_result", "README.md"),
+        Msg { tool_name: None, tool_call_id: None, ..msg("assistant", "Noted.") },
+    ];
+
+    let (queue_path, live, dead) = (queue_dir.path().to_owned(), cfg.clone(), Config { server_url: "http://127.0.0.1:9".into(), ..cfg });
+    let (offline, flushed, online) = tokio::task::spawn_blocking(move || {
+        let queue = Queue::new(&queue_path);
+        let down = Api::new(dead, Duration::from_secs(2)).unwrap();
+        let offline = capture(&down, &queue, "s-amem", turn.clone());
+        let up = Api::new(live, Duration::from_secs(10)).unwrap();
+        let flushed = queue.flush(&up);
+        let online = capture(&up, &queue, "s-amem-2", turn);
+        (offline, flushed, online)
+    })
+    .await
+    .unwrap();
+    assert_eq!((offline.sent, offline.queued), (0, 2), "server down → both requests queued");
+    assert_eq!((flushed.sent, flushed.remaining), (2, 0), "{flushed:?}");
+    assert_eq!((online.sent, online.queued), (2, 0), "{:?}", online.error);
+
+    let stored = client.call("/v3/conversation/query", client.scoped(json!({"limit": 10}))).await;
+    let contents: Vec<&str> = stored["data"]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["content"].as_str().unwrap())
+        .collect();
+    assert_eq!(contents.len(), 4, "two turns × user + assistant: {stored}");
+    assert!(contents.iter().all(|c| !c.contains("sk-ant-")), "secrets are redacted: {contents:?}");
+    assert!(contents.iter().any(|c| c.contains("[REDACTED:anthropic-key]")));
+}
+
+/// Upgrade path: data written to the legacy `default` buckets (before
+/// team/agent were required) is moved to a real scope, pipeline state
+/// included, and becomes reachable again.
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_default_data_migrates_to_a_real_scope() {
+    let (_data, client) = start().await;
+    assert_legacy_migration(&client).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_default_data_migrates_on_postgres() {
+    let Ok(url) = std::env::var("AGENT_MEMORY_TEST_POSTGRES_URL") else {
+        eprintln!("skipping: set AGENT_MEMORY_TEST_POSTGRES_URL to run against Postgres");
+        return;
+    };
+    let base_url = spawn_fake_llm().await;
+    let (_data, client) = start_with(|config| {
+        config.llm.base_url = base_url;
+        config.llm.api_key = "fake".into();
+        config.storage.backend = "postgres".into();
+        config.storage.postgres.url = url;
+    })
+    .await;
+    assert_legacy_migration(&client).await;
+    client.call_as("/v3/instance/destroy", "", json!({"instance_id": client.instance})).await;
+}
+
+/// Writes a turn to the legacy `default/default/default` bucket, as a
+/// pre-0.1.1 client did (the data plane no longer accepts it over HTTP).
+async fn seed_legacy(client: &Client, session: &str, text: &str) {
+    use memory_application::memory::service::NewMessage;
+    use memory_domain::memory::Role;
+    use memory_domain::scope::{MemoryScope, SegmentId};
+
+    let instance = SegmentId::parse("instance", &client.instance).unwrap();
+    let legacy = MemoryScope::from_optional(None, None, None, None).unwrap();
+    let message = |role, content: &str| NewMessage { role, content: content.into(), timestamp: None, recorded_at: None };
+    client
+        .state
+        .services
+        .memory
+        .add_conversation(&instance, &legacy, session, vec![message(Role::User, text), message(Role::Assistant, "Noted.")])
+        .await
+        .unwrap();
+}
+
+async fn assert_legacy_migration(client: &Client) {
+    seed_legacy(client, "legacy", "We release v2 next Monday; I always run integration tests first.").await;
+    client.wait_for(|s| s["l1"]["total"] == 2 && s["l2"] == 1 && s["l3"] == 1).await;
+
+    let agent = client
+        .call_as(
+            "/v3/meta/agent/create",
+            &client.admin_key,
+            json!({"team_id": client.team_id, "owner_user_id": client.user_id, "name": "hermes"}),
+        )
+        .await["data"]["agent_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let target = json!({"team_id": client.team_id, "agent_id": agent, "user_id": client.user_id});
+    let migrate = |dry_run: bool| {
+        let mut body = target.clone();
+        body["dry_run"] = json!(dry_run);
+        client.call_as("/v3/internal/migrate/default-scope", "", body)
+    };
+
+    let dry = migrate(true).await;
+    assert_eq!(dry["data"]["moved"]["conversations"], 2, "{dry}");
+    assert_eq!(dry["data"]["moved"]["atoms"], 2);
+    assert!(dry["data"]["moved"]["profile_files"].as_u64().unwrap() >= 2, "scene + persona: {dry}");
+    let scoped = |body: Value| {
+        let mut b = body;
+        b["team_id"] = json!(client.team_id);
+        b["agent_id"] = json!(agent);
+        b
+    };
+    let before = client.call("/v3/atomic/query", scoped(json!({}))).await;
+    assert_eq!(before["data"]["total"], 0, "a dry run changes nothing: {before}");
+
+    let done = migrate(false).await;
+    assert_eq!(done["data"]["moved"], dry["data"]["moved"], "{done}");
+    assert_eq!(done["data"]["session_states"], 1);
+    assert_eq!(done["data"]["profile_states"], 1);
+
+    let recall = client.call("/v3/recall", scoped(json!({"query": "when is the v2 release?"}))).await;
+    assert!(
+        recall["data"]["memories"].as_array().unwrap().iter().any(|m| m["content"].as_str().unwrap().contains("next Monday")),
+        "{recall}"
+    );
+    let persona = client.call("/v3/core/read", scoped(json!({}))).await;
+    assert!(persona["data"]["content"].as_str().unwrap().contains("User Narrative Profile"), "{persona}");
+
+    let again = migrate(false).await;
+    assert_eq!(again["code"], 0, "nothing left to move is a no-op: {again}");
+    assert_eq!(again["data"]["moved"]["conversations"], 0);
+    seed_legacy(client, "late", "One more legacy turn.").await;
+    let conflict = migrate(false).await;
+    assert_eq!(conflict["code"], 409, "the target now has L2/L3: {conflict}");
+    let stranger = client
+        .call_as(
+            "/v3/internal/migrate/default-scope",
+            "",
+            json!({"team_id": client.team_id, "agent_id": client.agent_id, "user_id": "usr-nobody"}),
+        )
+        .await;
+    assert_eq!(stranger["code"], 400, "{stranger}");
+}
+
+/// `internal/upgrade` needs only the instance key: it finds the admin,
+/// reuses or creates team and agent by name, moves the legacy data and
+/// issues a key that reaches it. Re-running it changes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn upgrade_rehomes_legacy_data_with_the_instance_key_only() {
+    let (_data, client) = start().await;
+    seed_legacy(&client, "legacy", "Our staging database is called KESTREL.").await;
+    client.wait_for(|s| s["l1"]["total"] == 2 && s["l2"] == 1 && s["l3"] == 1).await;
+    let upgrade = |body: Value| client.call_as("/v3/internal/upgrade", "", body);
+
+    let plan = upgrade(json!({"agent_name": "hermes", "dry_run": true})).await;
+    assert_eq!(plan["code"], 0, "{plan}");
+    assert_eq!(plan["data"]["team_id"], json!(client.team_id), "bootstrap team found by name: {plan}");
+    assert_eq!(plan["data"]["agent_id"], Value::Null, "agent not created by a dry run");
+    assert_eq!(plan["data"]["moved"]["conversations"], 2);
+
+    let done = upgrade(json!({"agent_name": "hermes", "issue_key": true})).await;
+    assert_eq!(done["code"], 0, "{done}");
+    let data = &done["data"];
+    assert_eq!((data["team_created"].clone(), data["agent_created"].clone()), (json!(false), json!(true)));
+    assert_eq!(data["moved"], plan["data"]["moved"]);
+    assert_eq!(data["username"], "admin");
+    let key = data["user_key"].as_str().expect("a fresh key").to_owned();
+    let agent = data["agent_id"].as_str().unwrap().to_owned();
+
+    let recall = client
+        .call_as("/v3/recall", &key, json!({"team_id": client.team_id, "agent_id": agent, "query": "when is the v2 release?"}))
+        .await;
+    // The fake LLM distills fixed atoms; what matters is that they moved.
+    assert!(recall["data"]["memories"].to_string().contains("next Monday"), "{recall}");
+    assert!(recall["data"]["append_system_context"].as_str().unwrap().contains("User Narrative Profile"));
+
+    let again = upgrade(json!({"agent_name": "hermes"})).await;
+    assert_eq!(again["code"], 0, "{again}");
+    assert_eq!(again["data"]["agent_id"], json!(agent), "same agent reused");
+    assert_eq!(again["data"]["agent_created"], false);
+    assert_eq!(again["data"]["moved"]["conversations"], 0);
+    assert!(again["data"].get("user_key").is_none());
+
+    let missing = upgrade(json!({"admin_username": "nobody"})).await;
+    assert_eq!(missing["code"], 404, "{missing}");
 }

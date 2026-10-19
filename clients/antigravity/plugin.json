@@ -1,0 +1,4 @@
+{
+  "name": "agent-memory",
+  "description": "Recall and capture for a self-hosted Agent Memory server (needs the `amem` binary on PATH and `amem login`)."
+}

@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use memory_application::admin::InstanceLifecycle;
 use memory_application::ports::coordination::KeyLock;
 use memory_application::ports::memory::{
-    AtomRepository, ConversationRepository, ProfileFileRepository,
+    AtomRepository, ConversationRepository, ProfileFileRepository, ScopeMigrationStore,
 };
 use memory_application::ports::meta::MetaStore;
 use memory_application::ports::pipeline::{
@@ -47,6 +47,8 @@ pub struct Storage {
     pub conversations: Arc<dyn ConversationRepository>,
     pub atoms: Arc<dyn AtomRepository>,
     pub profiles: Arc<dyn ProfileFileRepository>,
+    /// Upgrade path for the legacy `default` buckets.
+    pub scope_migration: Arc<dyn ScopeMigrationStore>,
     pub meta: Arc<dyn MetaStore>,
     pub skills: Arc<dyn SkillRepository>,
     pub skill_buffers: Arc<dyn SkillBufferStore>,
@@ -94,7 +96,8 @@ fn sqlite_storage(config: &Config, data_dir: &Path, vector_dims: Option<usize>) 
     Storage {
         conversations: memory.clone(),
         atoms: memory.clone(),
-        profiles: memory,
+        profiles: memory.clone(),
+        scope_migration: memory,
         meta: Arc::new(SqliteMetaStore::new(Arc::clone(&pool))),
         skills: skills.clone(),
         skill_buffers: skills,
@@ -136,7 +139,8 @@ async fn postgres_storage(
     Ok(Storage {
         conversations: memory.clone(),
         atoms: memory.clone(),
-        profiles: memory,
+        profiles: memory.clone(),
+        scope_migration: memory,
         meta: Arc::new(PostgresMetaStore::new(Arc::clone(&db))),
         skills: skills.clone(),
         skill_buffers: skills,

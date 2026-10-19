@@ -9,3 +9,5 @@
 .remember/
 /workspace
 .env.bak.*
+/backups
+/upgrade-client-settings.txt

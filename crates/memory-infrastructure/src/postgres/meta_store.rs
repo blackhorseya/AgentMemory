@@ -499,16 +499,18 @@ impl TeamRepository for PostgresMetaStore {
     async fn list_teams_of_user(
         &self,
         instance: &InstanceId,
-        user_id: &str,
+        user_id: Option<&str>,
         name: Option<&str>,
         page: Page,
     ) -> DomainResult<(Vec<Team>, usize)> {
         let s = self.db.schema(instance).await?;
         let mut w = Where::default();
-        w.raw(
-            &format!("team_id IN (SELECT team_id FROM {s}.meta_team_members WHERE user_id = ? AND status = 'active')"),
-            [Arg::from(user_id)],
-        );
+        if let Some(user_id) = user_id {
+            w.raw(
+                &format!("team_id IN (SELECT team_id FROM {s}.meta_team_members WHERE user_id = ? AND status = 'active')"),
+                [Arg::from(user_id)],
+            );
+        }
         if let Some(n) = name {
             w.raw("name ILIKE ?", [Arg::from(format!("%{n}%"))]);
         }

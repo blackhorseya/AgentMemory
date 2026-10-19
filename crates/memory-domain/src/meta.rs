@@ -7,6 +7,7 @@ use serde_json::Value;
 use crate::error::{DomainError, DomainResult};
 
 pub mod access;
+pub mod memory_access;
 
 macro_rules! string_enum {
     ($(#[$m:meta])* $name:ident { $($variant:ident => $text:literal),+ $(,)? }) => {

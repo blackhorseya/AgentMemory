@@ -15,6 +15,7 @@ export const PanelErrors = {
   BAD_REQUEST: "BAD_REQUEST",
   UNAUTHORIZED: "unauthorized: invalid_user_key",
   MISSING_USER_KEY: "unauthorized: missing_user_key",
+  ADMIN_ONLY: "forbidden: system_admin_required",
   CORE_TIMEOUT: "CORE_TIMEOUT",
   CORE_UNAVAILABLE: "CORE_UNAVAILABLE",
   INTERNAL: "INTERNAL_ERROR",

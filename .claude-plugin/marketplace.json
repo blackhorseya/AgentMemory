@@ -1,0 +1,16 @@
+{
+  "name": "agent-memory",
+  "owner": {
+    "name": "William Chang"
+  },
+  "metadata": {
+    "description": "Claude Code plugin for the self-hosted Agent Memory server"
+  },
+  "plugins": [
+    {
+      "name": "agent-memory",
+      "source": "./clients/claude-code",
+      "description": "Recall and capture for a self-hosted Agent Memory server (needs the `amem` binary on PATH)."
+    }
+  ]
+}

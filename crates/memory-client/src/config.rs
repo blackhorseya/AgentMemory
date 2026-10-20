@@ -16,6 +16,11 @@ pub struct Config {
     pub user_key: String,
     pub team_id: String,
     pub agent_id: String,
+    /// Comma-separated prefixes. A prompt that starts with one of them (after
+    /// leading whitespace) is not a person's turn: it is neither recalled for
+    /// nor captured. Empty by default.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub skip_prompt_prefixes: String,
 }
 
 fn default_service_id() -> String {
@@ -30,6 +35,9 @@ const FIELDS: [&str; 5] = [
     "agent_id",
 ];
 
+/// Settings that may stay empty, overridable like `FIELDS`.
+const OPTIONAL_FIELDS: [&str; 1] = ["skip_prompt_prefixes"];
+
 impl Config {
     /// File (if any) plus environment overrides.
     pub fn load() -> Result<Self, String> {
@@ -42,7 +50,7 @@ impl Config {
             service_id: default_service_id(),
             ..Default::default()
         });
-        for field in FIELDS {
+        for field in FIELDS.into_iter().chain(OPTIONAL_FIELDS) {
             let upper = field.to_uppercase();
             let value = env(&format!("AMEM_{upper}"))
                 .or_else(|| env(&format!("CLAUDE_PLUGIN_OPTION_{upper}")))
@@ -61,8 +69,18 @@ impl Config {
             "service_id" => &mut self.service_id,
             "user_key" => &mut self.user_key,
             "team_id" => &mut self.team_id,
+            "skip_prompt_prefixes" => &mut self.skip_prompt_prefixes,
             _ => &mut self.agent_id,
         }
+    }
+
+    /// Whether `prompt` starts with one of `skip_prompt_prefixes`.
+    pub fn skips_prompt(&self, prompt: &str) -> bool {
+        let prompt = prompt.trim_start();
+        self.skip_prompt_prefixes
+            .split(',')
+            .map(str::trim)
+            .any(|prefix| !prefix.is_empty() && prompt.starts_with(prefix))
     }
 
     /// Names of required fields that are still empty.
@@ -151,6 +169,7 @@ mod tests {
             user_key: "sk-mem-file".into(),
             team_id: "team-file".into(),
             agent_id: "agt-file".into(),
+            skip_prompt_prefixes: String::new(),
         };
         let c = Config::merge(Some(file), |k| match k {
             "AMEM_TEAM_ID" => Some("team-env".into()),
@@ -164,6 +183,25 @@ mod tests {
         assert_eq!(c.agent_id, "agt-plugin");
         assert_eq!(c.user_key, "sk-mem-file", "blank env values are ignored");
         assert!(c.missing().is_empty());
+    }
+
+    #[test]
+    fn skip_prompt_prefixes_match_the_start_only() {
+        let c = Config::merge(None, |k| {
+            (k == "AMEM_SKIP_PROMPT_PREFIXES").then(|| "[AGEND-, <task-notification>,".into())
+        });
+        assert!(c.skips_prompt("[AGEND-MSG] id=m-1 kind=task"));
+        assert!(c.skips_prompt("\n  <task-notification>done</task-notification>"));
+        assert!(
+            !c.skips_prompt("deploy it [AGEND-MSG] id=m-2"),
+            "only a leading prefix counts"
+        );
+        assert!(!c.skips_prompt("fix the build"));
+        assert!(!c.missing().contains(&"skip_prompt_prefixes"));
+        assert!(
+            !Config::default().skips_prompt("[AGEND-MSG]"),
+            "empty skips nothing"
+        );
     }
 
     #[test]

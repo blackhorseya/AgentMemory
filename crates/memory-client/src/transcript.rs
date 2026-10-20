@@ -110,6 +110,21 @@ pub fn complete_lines(text: &str) -> Vec<&str> {
     lines
 }
 
+/// Drops each turn whose prompt `skip` matches: that user message and
+/// everything after it up to the next user message that is kept. Messages
+/// before the first user message belong to an earlier turn and are kept.
+pub fn drop_skipped_turns(msgs: Vec<Msg>, skip: impl Fn(&str) -> bool) -> Vec<Msg> {
+    let mut skipping = false;
+    msgs.into_iter()
+        .filter(|m| {
+            if m.role == "user" {
+                skipping = skip(&m.content);
+            }
+            !skipping
+        })
+        .collect()
+}
+
 // ── Claude Code (~/.claude/projects/<cwd>/<session>.jsonl) ──────────────
 
 pub fn claude_code(lines: &[&str]) -> Vec<Msg> {
@@ -390,6 +405,32 @@ pub fn codex(events: &[Value]) -> Vec<Msg> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn skipped_turns_are_dropped_whole() {
+        let msgs = vec![
+            Msg::text("assistant", "end of an earlier turn".into()),
+            Msg::text("user", "[AGEND-MSG] id=1".into()),
+            Msg::tool(
+                "tool_call",
+                "{}".into(),
+                Some("Bash".into()),
+                Some("t1".into()),
+            ),
+            Msg::tool("tool_result", "ok".into(), None, Some("t1".into())),
+            Msg::text("assistant", "relayed".into()),
+            Msg::text("user", "fix the build".into()),
+            Msg::text("assistant", "Fixed.".into()),
+            Msg::text("user", "[AGEND-MSG] id=2".into()),
+            Msg::text("assistant", "noted".into()),
+        ];
+        let kept = drop_skipped_turns(msgs, |p| p.starts_with("[AGEND-"));
+        let contents: Vec<_> = kept.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            ["end of an earlier turn", "fix the build", "Fixed."]
+        );
+    }
 
     #[test]
     fn claude_code_turn_with_tools() {

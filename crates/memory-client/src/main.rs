@@ -24,7 +24,9 @@ USAGE:
 
 `--user-key -` reads the key from stdin, keeping it out of shell history.
 Settings can be overridden with AMEM_SERVER_URL, AMEM_USER_KEY, AMEM_TEAM_ID,
-AMEM_AGENT_ID, AMEM_SERVICE_ID; AMEM_CONFIG and AMEM_DATA_DIR move the files.";
+AMEM_AGENT_ID, AMEM_SERVICE_ID; AMEM_SKIP_PROMPT_PREFIXES (comma-separated)
+skips recall and capture for prompts starting with one of them; AMEM_CONFIG
+and AMEM_DATA_DIR move the files.";
 
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -67,6 +69,7 @@ fn login(args: &[String]) -> Result<(), String> {
         user_key: user_key.trim().to_owned(),
         team_id: pick("--team-id", &existing.team_id),
         agent_id: pick("--agent-id", &existing.agent_id),
+        skip_prompt_prefixes: existing.skip_prompt_prefixes.clone(),
     };
     if let Some(missing) = cfg.missing().first() {
         return Err(format!("missing --{}", missing.replace('_', "-")));
@@ -96,6 +99,9 @@ fn status() -> Result<(), String> {
     println!("user_key:   {}", mask(&cfg.user_key));
     println!("team_id:    {}", cfg.team_id);
     println!("agent_id:   {}", cfg.agent_id);
+    if !cfg.skip_prompt_prefixes.is_empty() {
+        println!("skip_prompt_prefixes: {}", cfg.skip_prompt_prefixes);
+    }
     let queue = Queue::new(&data_dir());
     println!(
         "queued:     {} (in {})",

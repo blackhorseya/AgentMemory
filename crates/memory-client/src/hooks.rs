@@ -12,7 +12,8 @@ use crate::capture::capture;
 use crate::config::{data_dir, write_private, Config};
 use crate::queue::Queue;
 use crate::transcript::{
-    antigravity, antigravity_last_request, claude_code, codex, complete_lines, Msg,
+    antigravity, antigravity_last_request, claude_code, codex, complete_lines, drop_skipped_turns,
+    Msg,
 };
 
 /// Claude Code caps injected context at 10,000 characters.
@@ -108,6 +109,10 @@ fn deliver(host: &str, session: &str, msgs: Vec<Msg>) {
     }
     match api(CAPTURE_TIMEOUT) {
         Ok(api) => {
+            let msgs = drop_skipped_turns(msgs, |p| api.config().skips_prompt(p));
+            if msgs.is_empty() {
+                return;
+            }
             let r = capture(&api, &Queue::new(&data_dir()), session, msgs);
             if let Some(e) = r.error {
                 log(&format!(
@@ -124,7 +129,11 @@ fn recall_or_log(host: &str, query: &str) -> Option<String> {
     if query.trim().chars().count() < 2 {
         return None;
     }
-    let result = api(RECALL_TIMEOUT).and_then(|a| a.recall(query, None).map_err(|e| e.to_string()));
+    let api = match api(RECALL_TIMEOUT) {
+        Ok(api) if api.config().skips_prompt(query) => return None,
+        other => other,
+    };
+    let result = api.and_then(|a| a.recall(query, None).map_err(|e| e.to_string()));
     match result {
         Ok(data) => Some(clip(&recall_context(&data), MAX_CONTEXT_CHARS)).filter(|c| !c.is_empty()),
         Err(e) => {

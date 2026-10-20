@@ -33,6 +33,11 @@
       "title": "Service ID",
       "description": "Memory instance (x-memory-service-id).",
       "default": "default"
+    },
+    "skip_prompt_prefixes": {
+      "type": "string",
+      "title": "Skip prompt prefixes",
+      "description": "Comma-separated. Prompts starting with one of these (e.g. messages an orchestrator types in) are neither recalled for nor captured. Leave empty to use `amem login`'s setting."
     }
   }
 }

@@ -137,6 +137,8 @@ amem recall "release plan"  # 印出 agent 會收到的內容
 
 同一台機器上的所有工具共用這份設定。也可以用 `AMEM_SERVER_URL`、`AMEM_USER_KEY`、`AMEM_TEAM_ID`、`AMEM_AGENT_ID`、`AMEM_SERVICE_ID` 針對單一程序覆寫。若要讓每個工具使用不同的 agent，請使用下面各 plugin 的設定，或在該工具的環境變數中設定 `AMEM_AGENT_ID`。
 
+有些 prompt 不是人打的，例如 orchestrator 輸入給 agent 的訊息。把 `AMEM_SKIP_PROMPT_PREFIXES`（或 `client.json` 的 `skip_prompt_prefixes`）設成以逗號分隔的前綴清單，例如 `[AGEND-`。去掉開頭空白後以其中一個前綴開頭的 prompt 不會拿來 recall，整輪也不會被 capture。只比對 prompt 的開頭，所以人打的 prompt 只是中間出現前綴時照常 capture。預設為空，也就是不略過任何 prompt。
+
 ## 5. Claude Code
 
 Plugin 位於 `clients/claude-code`，透過本 repo 的 marketplace（`.claude-plugin/marketplace.json`）發佈。
@@ -148,7 +150,7 @@ claude plugin install agent-memory@agent-memory
 
 若有本機 checkout，也可以改用 `claude plugin marketplace add /path/to/AgentMemory`。
 
-啟用 plugin 時，Claude Code 會詢問設定：Server URL、User key（存在系統金鑰圈）、Team ID、Agent ID、Service ID。**全部留空就會沿用 `amem login` 的設定**；填寫的話只對 Claude Code 生效，常見用法是另外指定 `agent_id`。
+啟用 plugin 時，Claude Code 會詢問設定：Server URL、User key（存在系統金鑰圈）、Team ID、Agent ID、Service ID、要略過的 prompt 前綴。**全部留空就會沿用 `amem login` 的設定**；填寫的話只對 Claude Code 生效，常見用法是另外指定 `agent_id`。
 
 Plugin 的行為：
 

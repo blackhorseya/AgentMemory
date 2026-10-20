@@ -154,8 +154,10 @@ impl CliLlm {
 }
 
 /// Some tools print errors (e.g. "Not logged in") on stdout, not stderr.
-/// Keeps the end of the output: tools such as `codex exec` echo a banner and
-/// the whole prompt first, and print the actual error last.
+/// Tools such as `codex exec` echo a banner and the whole prompt first, and
+/// print the actual error last. Starts at the last line that begins with
+/// `error` (any case, followed by `:`), so a short error does not drag the
+/// end of the echoed conversation into logs; otherwise keeps the end.
 fn failure_reason(stderr: &[u8], stdout: &[u8]) -> String {
     let stderr = String::from_utf8_lossy(stderr);
     let source = if stderr.trim().is_empty() {
@@ -164,12 +166,38 @@ fn failure_reason(stderr: &[u8], stdout: &[u8]) -> String {
         stderr
     };
     let source = source.trim();
+    if let Some(start) = last_error_line(source) {
+        let error = &source[start..];
+        if error.chars().count() <= STDERR_SNIPPET_CHARS {
+            return error.to_owned();
+        }
+        let head: String = error.chars().take(STDERR_SNIPPET_CHARS).collect();
+        return format!("{head}…");
+    }
     let chars = source.chars().count();
     if chars <= STDERR_SNIPPET_CHARS {
         return source.to_owned();
     }
     let tail: String = source.chars().skip(chars - STDERR_SNIPPET_CHARS).collect();
     format!("…{tail}")
+}
+
+/// Byte offset of the last line starting with `error:` (ignoring case and
+/// leading whitespace), e.g. codex's `ERROR: {...}`.
+fn last_error_line(source: &str) -> Option<usize> {
+    let mut offset = 0;
+    let mut found = None;
+    for line in source.split_inclusive('\n') {
+        let text = line.trim_start();
+        if text
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("error:"))
+        {
+            found = Some(offset + line.len() - text.len());
+        }
+        offset += line.len();
+    }
+    found
 }
 
 fn unavailable(detail: String) -> DomainError {
@@ -268,13 +296,26 @@ mod tests {
     async fn failures_and_timeouts_are_unavailable_errors() {
         assert_eq!(failure_reason(b"", b"Not logged in\n"), "Not logged in");
         assert_eq!(failure_reason(b"boom", b"ignored"), "boom");
+        // A short error keeps none of the echoed conversation.
         let echoed = format!(
-            "OpenAI Codex\n--------\nuser\n{}\nERROR: Selected model is at capacity.\n",
-            "prompt ".repeat(200)
+            "OpenAI Codex\n--------\nuser\n{}\nERROR: stream disconnected\n",
+            "secret ".repeat(200)
         );
-        let reason = failure_reason(echoed.as_bytes(), b"");
+        assert_eq!(
+            failure_reason(echoed.as_bytes(), b""),
+            "ERROR: stream disconnected"
+        );
+        // The last error line wins, and a long one keeps its start.
+        let long = format!("error: earlier\n  Error: {}", "x".repeat(400));
+        let reason = failure_reason(long.as_bytes(), b"");
+        assert!(reason.starts_with("Error: xxx"));
+        assert!(reason.ends_with('…'));
+        assert_eq!(reason.chars().count(), STDERR_SNIPPET_CHARS + 1);
+        // Without an error line, the end of the output is kept.
+        let unmarked = format!("{}\nmodel is at capacity", "prompt ".repeat(200));
+        let reason = failure_reason(unmarked.as_bytes(), b"");
         assert!(reason.starts_with('…'));
-        assert!(reason.ends_with("ERROR: Selected model is at capacity."));
+        assert!(reason.ends_with("model is at capacity"));
         assert_eq!(reason.chars().count(), STDERR_SNIPPET_CHARS + 1);
         let failing = cli("false", &[], PromptMode::Arg)
             .complete(&ask())

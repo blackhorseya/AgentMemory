@@ -306,6 +306,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn failure_reason_cuts_only_past_the_snippet_limit() {
+        // Counted in characters, not bytes: "é" is two bytes.
+        let exact = "é".repeat(STDERR_SNIPPET_CHARS);
+        assert_eq!(failure_reason(exact.as_bytes(), b""), exact);
+        let over = format!("x{exact}");
+        assert_eq!(failure_reason(over.as_bytes(), b""), format!("…{exact}"));
+    }
+
     #[tokio::test]
     async fn failures_and_timeouts_are_unavailable_errors() {
         assert_eq!(

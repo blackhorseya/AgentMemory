@@ -83,7 +83,10 @@ pub fn requests(session_id: &str, msgs: &[Msg]) -> Vec<(&'static str, Value)> {
     let text: Vec<Value> = msgs
         .iter()
         .filter(|m| m.is_text())
-        .map(|m| json!({"role": m.role, "content": m.content}))
+        .map(|m| match &m.timestamp {
+            Some(at) => json!({"role": m.role, "content": m.content, "timestamp": at}),
+            None => json!({"role": m.role, "content": m.content}),
+        })
         .collect();
     let mut out = Vec::new();
     for batch in text.chunks(CORE_TEXT_MESSAGES) {
@@ -152,6 +155,7 @@ mod tests {
             content: content.into(),
             tool_name: None,
             tool_call_id: None,
+            timestamp: None,
         }
     }
 
@@ -234,5 +238,15 @@ mod tests {
         );
         assert_eq!(with_tools[0].1["messages"].as_array().unwrap().len(), 2);
         assert_eq!(with_tools[1].1["messages"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn text_carries_its_timestamp_when_known() {
+        let mut dated = msg("user", "hi");
+        dated.timestamp = Some("2026-10-12T05:00:00Z".into());
+        let reqs = requests("s", &[dated, msg("assistant", "hello")]);
+        let messages = reqs[0].1["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["timestamp"], "2026-10-12T05:00:00Z");
+        assert!(messages[1].get("timestamp").is_none());
     }
 }

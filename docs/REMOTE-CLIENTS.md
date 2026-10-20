@@ -137,6 +137,8 @@ amem recall "release plan"  # prints what an agent would receive
 
 All hosts on this machine share these settings. You can override them per process with `AMEM_SERVER_URL`, `AMEM_USER_KEY`, `AMEM_TEAM_ID`, `AMEM_AGENT_ID` and `AMEM_SERVICE_ID`. To give each tool its own agent, use the plugin settings below or set `AMEM_AGENT_ID` in that tool's environment.
 
+Some prompts are not a person's turn, for example messages that an orchestrator types into the agent. Set `AMEM_SKIP_PROMPT_PREFIXES` (or `skip_prompt_prefixes` in `client.json`) to a comma-separated list of prefixes, such as `[AGEND-`. A prompt that starts with one of them, after any leading whitespace, is not used for recall, and its whole turn is not captured. Prefixes are compared at the start of the prompt only, so a person's prompt that merely contains one is still captured. The default is empty, which skips nothing.
+
 ## 5. Claude Code
 
 The plugin lives in `clients/claude-code` and is published through this repository's marketplace (`.claude-plugin/marketplace.json`).
@@ -148,7 +150,7 @@ claude plugin install agent-memory@agent-memory
 
 From a local checkout you can instead run `claude plugin marketplace add /path/to/AgentMemory`.
 
-When the plugin is enabled, Claude Code offers its settings: server URL, user key (stored in the system keychain), team ID, agent ID and service ID. **Leave them empty to use `amem login`**, or fill them in to override it for Claude Code only. A typical use is a separate `agent_id`.
+When the plugin is enabled, Claude Code offers its settings: server URL, user key (stored in the system keychain), team ID, agent ID, service ID and prompt prefixes to skip. **Leave them empty to use `amem login`**, or fill them in to override it for Claude Code only. A typical use is a separate `agent_id`.
 
 What the plugin does:
 

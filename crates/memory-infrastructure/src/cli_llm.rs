@@ -154,6 +154,8 @@ impl CliLlm {
 }
 
 /// Some tools print errors (e.g. "Not logged in") on stdout, not stderr.
+/// Keeps the end of the output: tools such as `codex exec` echo a banner and
+/// the whole prompt first, and print the actual error last.
 fn failure_reason(stderr: &[u8], stdout: &[u8]) -> String {
     let stderr = String::from_utf8_lossy(stderr);
     let source = if stderr.trim().is_empty() {
@@ -161,7 +163,13 @@ fn failure_reason(stderr: &[u8], stdout: &[u8]) -> String {
     } else {
         stderr
     };
-    source.trim().chars().take(STDERR_SNIPPET_CHARS).collect()
+    let source = source.trim();
+    let chars = source.chars().count();
+    if chars <= STDERR_SNIPPET_CHARS {
+        return source.to_owned();
+    }
+    let tail: String = source.chars().skip(chars - STDERR_SNIPPET_CHARS).collect();
+    format!("…{tail}")
 }
 
 fn unavailable(detail: String) -> DomainError {
@@ -260,6 +268,14 @@ mod tests {
     async fn failures_and_timeouts_are_unavailable_errors() {
         assert_eq!(failure_reason(b"", b"Not logged in\n"), "Not logged in");
         assert_eq!(failure_reason(b"boom", b"ignored"), "boom");
+        let echoed = format!(
+            "OpenAI Codex\n--------\nuser\n{}\nERROR: Selected model is at capacity.\n",
+            "prompt ".repeat(200)
+        );
+        let reason = failure_reason(echoed.as_bytes(), b"");
+        assert!(reason.starts_with('…'));
+        assert!(reason.ends_with("ERROR: Selected model is at capacity."));
+        assert_eq!(reason.chars().count(), STDERR_SNIPPET_CHARS + 1);
         let failing = cli("false", &[], PromptMode::Arg)
             .complete(&ask())
             .await

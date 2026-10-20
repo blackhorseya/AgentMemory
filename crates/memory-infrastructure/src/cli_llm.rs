@@ -139,7 +139,7 @@ impl CliLlm {
                 "`{}` exited with {}: {}",
                 self.settings.command,
                 output.status,
-                failure_reason(&output.stderr, &output.stdout)
+                failure_reason(&output.stderr, &output.stdout, &prompt)
             )));
         }
         let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
@@ -154,22 +154,64 @@ impl CliLlm {
 }
 
 /// Some tools print errors (e.g. "Not logged in") on stdout, not stderr.
-/// Keeps the end of the output: tools such as `codex exec` echo a banner and
-/// the whole prompt first, and print the actual error last.
-fn failure_reason(stderr: &[u8], stdout: &[u8]) -> String {
+/// Tools such as `codex exec` echo a banner and the whole prompt first, and
+/// print the actual error last. Only what a tool prints after its echo of
+/// the prompt is used, so the user conversation never reaches logs or the
+/// Panel. From that, starts at the last line that begins with `error:` (any
+/// case) and cuts a long one at its end (`head…`); without such a line,
+/// keeps the end of the output (`…tail`).
+fn failure_reason(stderr: &[u8], stdout: &[u8], prompt: &str) -> String {
     let stderr = String::from_utf8_lossy(stderr);
-    let source = if stderr.trim().is_empty() {
-        String::from_utf8_lossy(stdout)
-    } else {
-        stderr
+    let stdout = String::from_utf8_lossy(stdout);
+    let source = match after_echo(&stderr, prompt) {
+        "" => after_echo(&stdout, prompt),
+        stderr => stderr,
     };
-    let source = source.trim();
+    if source.is_empty() {
+        return "no error output".to_owned();
+    }
+    if let Some(start) = last_error_line(source) {
+        let error = &source[start..];
+        if error.chars().count() <= STDERR_SNIPPET_CHARS {
+            return error.to_owned();
+        }
+        let head: String = error.chars().take(STDERR_SNIPPET_CHARS).collect();
+        return format!("{head}…");
+    }
     let chars = source.chars().count();
     if chars <= STDERR_SNIPPET_CHARS {
         return source.to_owned();
     }
     let tail: String = source.chars().skip(chars - STDERR_SNIPPET_CHARS).collect();
     format!("…{tail}")
+}
+
+/// The part of `output` after the last verbatim echo of `prompt`, or all of
+/// it when the tool did not echo the prompt; trimmed.
+fn after_echo<'a>(output: &'a str, prompt: &str) -> &'a str {
+    let prompt = prompt.trim();
+    match output.rfind(prompt).filter(|_| !prompt.is_empty()) {
+        Some(i) => output[i + prompt.len()..].trim(),
+        None => output.trim(),
+    }
+}
+
+/// Byte offset of the last line starting with `error:` (ignoring case and
+/// leading whitespace), e.g. codex's `ERROR: {...}`.
+fn last_error_line(source: &str) -> Option<usize> {
+    let mut offset = 0;
+    let mut found = None;
+    for line in source.split_inclusive('\n') {
+        let text = line.trim_start();
+        if text
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("error:"))
+        {
+            found = Some(offset + line.len() - text.len());
+        }
+        offset += line.len();
+    }
+    found
 }
 
 fn unavailable(detail: String) -> DomainError {
@@ -268,23 +310,67 @@ mod tests {
     fn failure_reason_cuts_only_past_the_snippet_limit() {
         // Counted in characters, not bytes: "é" is two bytes.
         let exact = "é".repeat(STDERR_SNIPPET_CHARS);
-        assert_eq!(failure_reason(exact.as_bytes(), b""), exact);
+        assert_eq!(failure_reason(exact.as_bytes(), b"", ""), exact);
         let over = format!("x{exact}");
-        assert_eq!(failure_reason(over.as_bytes(), b""), format!("…{exact}"));
+        assert_eq!(
+            failure_reason(over.as_bytes(), b"", ""),
+            format!("…{exact}")
+        );
     }
 
     #[tokio::test]
     async fn failures_and_timeouts_are_unavailable_errors() {
-        assert_eq!(failure_reason(b"", b"Not logged in\n"), "Not logged in");
-        assert_eq!(failure_reason(b"boom", b"ignored"), "boom");
-        let echoed = format!(
-            "OpenAI Codex\n--------\nuser\n{}\nERROR: Selected model is at capacity.\n",
-            "prompt ".repeat(200)
+        assert_eq!(
+            failure_reason(b"", b"Not logged in\n", "hi"),
+            "Not logged in"
         );
-        let reason = failure_reason(echoed.as_bytes(), b"");
-        assert!(reason.starts_with('…'));
-        assert!(reason.ends_with("ERROR: Selected model is at capacity."));
+        assert_eq!(failure_reason(b"boom", b"ignored", "hi"), "boom");
+        // Only what follows the echoed prompt counts, so an `error:` line in
+        // the conversation is not taken for the tool's own error.
+        let prompt = "error: could not compile `app`\nMy API token is tok_live_ABC";
+        let echoed = format!(
+            "OpenAI Codex\n--------\nuser\n{prompt}\n\nstream disconnected before completion\n"
+        );
+        assert_eq!(
+            failure_reason(echoed.as_bytes(), b"", prompt),
+            "stream disconnected before completion"
+        );
+        let echoed = format!("user\n{prompt}\nERROR: stream disconnected\n");
+        assert_eq!(
+            failure_reason(echoed.as_bytes(), b"", prompt),
+            "ERROR: stream disconnected"
+        );
+        // Nothing after the echo: say so instead of returning the prompt.
+        assert_eq!(
+            failure_reason(format!("user\n{prompt}\n").as_bytes(), b"", prompt),
+            "no error output"
+        );
+        // The last error line wins, and a long one keeps its start.
+        let long = format!("error: earlier\n  Error: {}", "x".repeat(400));
+        let reason = failure_reason(long.as_bytes(), b"", "hi");
+        assert!(reason.starts_with("Error: xxx"));
+        assert!(reason.ends_with('…'));
         assert_eq!(reason.chars().count(), STDERR_SNIPPET_CHARS + 1);
+        // Without an error line, the end of the output is kept.
+        let unmarked = format!("{}\nmodel is at capacity", "log ".repeat(200));
+        let reason = failure_reason(unmarked.as_bytes(), b"", "hi");
+        assert!(reason.starts_with('…'));
+        assert!(reason.ends_with("model is at capacity"));
+        assert_eq!(reason.chars().count(), STDERR_SNIPPET_CHARS + 1);
+        // End to end: a tool that echoes its stdin prompt to stderr.
+        let echoing = cli(
+            "sh",
+            &[
+                "-c",
+                "cat >&2; echo >&2; echo stream disconnected >&2; exit 1",
+            ],
+            PromptMode::Stdin,
+        )
+        .complete(&[ChatMessage::user(prompt)])
+        .await
+        .unwrap_err();
+        assert!(echoing.detail.ends_with(": stream disconnected"));
+        assert!(!echoing.detail.contains("tok_live"));
         let failing = cli("false", &[], PromptMode::Arg)
             .complete(&ask())
             .await

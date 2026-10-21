@@ -17,8 +17,6 @@ English | [繁體中文](./README.zh-tw.md)
 
 **Self-hosted, team-aware long-term memory for AI agents.** AgentMemory gives Claude Code, Codex, Antigravity, Hermes and any MCP client a memory that persists across sessions. It captures each conversation, distils it into facts, scenes and a persona in the background, and recalls what is relevant before every prompt. It all runs on your own servers.
 
-![AgentMemory connects Claude Code, Antigravity, Hermes and other agents to one shared long-term memory](./docs/imgs/agent-memory.jpg)
-
 ## Why AgentMemory
 
 - **Your data stays with you.** Memory, database and even the distillation model can all run inside your network. There is no dependency on any vendor's cloud service: any OpenAI-compatible endpoint works, including self-hosted models, as does a local CLI such as `claude`, `codex` or `agy`.

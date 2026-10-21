@@ -19,6 +19,10 @@ pub struct Msg {
     /// the conversation rather than of the capture.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<String>,
+    /// A user message sent while the agent was still working on a turn. It
+    /// belongs to that turn rather than starting a new one.
+    #[serde(skip)]
+    pub interjected: bool,
 }
 
 impl Msg {
@@ -29,6 +33,7 @@ impl Msg {
             tool_name: None,
             tool_call_id: None,
             timestamp: None,
+            interjected: false,
         }
     }
 
@@ -39,7 +44,13 @@ impl Msg {
             tool_name: name,
             tool_call_id: id,
             timestamp: None,
+            interjected: false,
         }
+    }
+
+    fn interjected(mut self) -> Self {
+        self.interjected = true;
+        self
     }
 
     fn at(mut self, timestamp: Option<&str>) -> Self {
@@ -53,12 +64,14 @@ impl Msg {
 }
 
 /// Appends, merging consecutive text of the same role and dropping blanks.
+/// Interjected messages are never merged: each one is skipped or kept on
+/// its own.
 fn push(out: &mut Vec<Msg>, msg: Msg) {
     if msg.content.trim().is_empty() && msg.is_text() {
         return;
     }
     if let Some(last) = out.last_mut() {
-        if msg.is_text() && last.role == msg.role {
+        if msg.is_text() && last.role == msg.role && !last.interjected && !msg.interjected {
             last.content.push_str("\n\n");
             last.content.push_str(&msg.content);
             return;
@@ -113,16 +126,49 @@ pub fn complete_lines(text: &str) -> Vec<&str> {
 /// Drops each turn whose prompt `skip` matches: that user message and
 /// everything after it up to the next user message that is kept. Messages
 /// before the first user message belong to an earlier turn and are kept.
+/// An interjected message does not start a turn: it is dropped alone when
+/// `skip` matches it and kept otherwise, and the turn around it is unchanged.
 pub fn drop_skipped_turns(msgs: Vec<Msg>, skip: impl Fn(&str) -> bool) -> Vec<Msg> {
     let mut skipping = false;
     msgs.into_iter()
         .filter(|m| {
+            if m.role == "user" && m.interjected {
+                return !skip(&m.content);
+            }
             if m.role == "user" {
                 skipping = skip(&m.content);
             }
             !skipping
         })
         .collect()
+}
+
+/// The prompt of a message the user sent while the agent was working, which
+/// Claude Code records as a `queued_command` attachment, not a user entry.
+/// Other queued commands are not a person's turn: task notifications, and
+/// messages from other sessions (meta, with a non-human origin). An entry
+/// without an origin is taken as the person's.
+fn queued_prompt(entry: &Value) -> Option<String> {
+    let attachment = entry.get("attachment")?;
+    let origin = attachment.get("origin").and_then(|o| str_of(o, "kind"));
+    if str_of(attachment, "type") != Some("queued_command")
+        || str_of(attachment, "commandMode") != Some("prompt")
+        || attachment.get("isMeta").and_then(Value::as_bool) == Some(true)
+        || origin.is_some_and(|kind| kind != "human")
+    {
+        return None;
+    }
+    let text = match attachment.get("prompt")? {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|b| str_of(b, "type") == Some("text"))
+            .filter_map(|b| str_of(b, "text"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return None,
+    };
+    Some(strip_reminders(&text))
 }
 
 // ── Claude Code (~/.claude/projects/<cwd>/<session>.jsonl) ──────────────
@@ -141,6 +187,11 @@ pub fn claude_code(lines: &[&str]) -> Vec<Msg> {
         let at = str_of(&entry, "timestamp");
         let content = entry.get("message").and_then(|m| m.get("content"));
         match (kind, content) {
+            ("attachment", _) => {
+                if let Some(prompt) = queued_prompt(&entry) {
+                    push(&mut out, Msg::text("user", prompt).interjected().at(at));
+                }
+            }
             ("user", Some(Value::String(s))) => {
                 push(&mut out, Msg::text("user", strip_reminders(s)).at(at))
             }
@@ -430,6 +481,115 @@ mod tests {
             contents,
             ["end of an earlier turn", "fix the build", "Fixed."]
         );
+    }
+
+    #[test]
+    fn interjected_messages_do_not_split_the_turn() {
+        let msgs = vec![
+            Msg::text("user", "fix the build".into()),
+            Msg::text("assistant", "Looking.".into()),
+            Msg::text("user", "[AGEND-MSG] id=1".into()).interjected(),
+            Msg::text("assistant", "Fixed.".into()),
+            Msg::text("user", "[AGEND-MSG] id=2".into()),
+            Msg::text("user", "also run the tests".into()).interjected(),
+            Msg::text("assistant", "relayed".into()),
+        ];
+        let kept = drop_skipped_turns(msgs, |p| p.starts_with("[AGEND-"));
+        let contents: Vec<_> = kept.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            ["fix the build", "Looking.", "Fixed.", "also run the tests"]
+        );
+    }
+
+    #[test]
+    fn claude_code_queued_prompts_are_user_messages() {
+        let queued = |mode: &str, prompt: Value| {
+            json!({"type":"attachment","timestamp":"2026-10-20T13:10:09.176Z","attachment":{
+                "type":"queued_command","commandMode":mode,"prompt":prompt}})
+            .to_string()
+        };
+        let lines = [
+            json!({"type":"user","message":{"content":"install it"}}).to_string(),
+            json!({"type":"assistant","message":{"content":[{"type":"text","text":"Installing."}]}}).to_string(),
+            queued("prompt", json!("globally")),
+            queued("task-notification", json!("<task-notification>done</task-notification>")),
+            queued("prompt", json!([{"type":"image"},{"type":"text","text":"like this"}])),
+            json!({"type":"attachment","attachment":{"type":"hook_success"}}).to_string(),
+            json!({"type":"assistant","message":{"content":[{"type":"text","text":"Installed globally."}]}}).to_string(),
+        ];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let msgs = claude_code(&refs);
+        let got: Vec<_> = msgs
+            .iter()
+            .map(|m| (m.role, m.content.as_str(), m.interjected))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("user", "install it", false),
+                ("assistant", "Installing.", false),
+                ("user", "globally", true),
+                ("user", "like this", true),
+                ("assistant", "Installed globally.", false),
+            ]
+        );
+        assert_eq!(
+            msgs[2].timestamp.as_deref(),
+            Some("2026-10-20T13:10:09.176Z")
+        );
+    }
+
+    #[test]
+    fn adjacent_queued_prompts_are_skipped_one_by_one() {
+        let queued = |prompt: &str| {
+            json!({"type":"attachment","attachment":{
+                "type":"queued_command","commandMode":"prompt","prompt":prompt}})
+            .to_string()
+        };
+        let lines = [
+            json!({"type":"user","message":{"content":"fix the build"}}).to_string(),
+            json!({"type":"assistant","message":{"content":[{"type":"text","text":"Looking."}]}})
+                .to_string(),
+            queued("[AGEND-MSG] id=1"),
+            queued("also run the tests"),
+            queued("[AGEND-MSG] id=2"),
+            json!({"type":"assistant","message":{"content":[{"type":"text","text":"Done."}]}})
+                .to_string(),
+        ];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let kept = drop_skipped_turns(claude_code(&refs), |p| p.starts_with("[AGEND-"));
+        let contents: Vec<_> = kept.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            ["fix the build", "Looking.", "also run the tests", "Done."]
+        );
+    }
+
+    #[test]
+    fn queued_prompts_from_other_sessions_are_not_user_messages() {
+        let queued = |origin: Value, meta: bool, prompt: &str| {
+            json!({"type":"attachment","attachment":{
+                "type":"queued_command","commandMode":"prompt","isMeta":meta,
+                "origin":origin,"prompt":prompt}})
+            .to_string()
+        };
+        let lines = [
+            queued(json!({"kind":"human"}), false, "from a person"),
+            queued(
+                json!({"kind":"peer","from":"uds:/tmp/s.sock"}),
+                true,
+                "from another session",
+            ),
+            queued(json!({"kind":"peer"}), false, "peer without meta"),
+            queued(json!({"kind":"human"}), true, "meta from a person"),
+            json!({"type":"attachment","attachment":{
+                "type":"queued_command","commandMode":"prompt","prompt":"no origin"}})
+            .to_string(),
+        ];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let contents: Vec<_> = claude_code(&refs).into_iter().map(|m| m.content).collect();
+        assert_eq!(contents, ["from a person", "no origin"]);
     }
 
     #[test]

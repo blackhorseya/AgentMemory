@@ -411,3 +411,32 @@ async fn deleting_an_asset_cascades_bindings() {
         .unwrap()
         .is_empty());
 }
+
+#[tokio::test]
+async fn atoms_can_be_queried_by_session() {
+    let (_dir, pool, department) = setup();
+    let store = SqliteMemoryStore::new(pool, None);
+    let mut other = atom("a2", "from another session", "u1");
+    other.session_id = Some("s2".into());
+    for a in [atom("a1", "from this session", "u1"), other] {
+        store.upsert(&department, &a, None).await.unwrap();
+    }
+    let filter = AtomFilter {
+        session_id: Some("s1".into()),
+        ..Default::default()
+    };
+    let (found, total) = AtomRepository::query(
+        &store,
+        &department,
+        AtomSelector::Scope(&scope("u1")),
+        &filter,
+        Page {
+            limit: 10,
+            offset: 0,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(total, 1);
+    assert_eq!(found[0].id, "a1");
+}

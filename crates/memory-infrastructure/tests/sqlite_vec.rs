@@ -216,6 +216,7 @@ async fn atom_type_and_time_filters_apply_in_the_index() {
 
     let typed = AtomFilter {
         atom_type: Some(AtomType::Instruction),
+        session_id: None,
         time: TimeRange::default(),
     };
     let hits = search(&store, &f, &alice, &[1.0, 0.0], &typed, 5).await;
@@ -223,6 +224,7 @@ async fn atom_type_and_time_filters_apply_in_the_index() {
 
     let recent = AtomFilter {
         atom_type: Some(AtomType::Instruction),
+        session_id: None,
         time: TimeRange {
             start: Some(now - Duration::days(1)),
             end: Some(now + Duration::days(1)),
@@ -233,6 +235,7 @@ async fn atom_type_and_time_filters_apply_in_the_index() {
 
     let until = AtomFilter {
         atom_type: None,
+        session_id: None,
         time: TimeRange {
             start: None,
             end: Some(now - Duration::days(1)),

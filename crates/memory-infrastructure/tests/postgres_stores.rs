@@ -652,3 +652,35 @@ async fn an_unreachable_server_fails_fast_as_unavailable() {
     );
     assert!(started.elapsed() < std::time::Duration::from_secs(15));
 }
+
+#[tokio::test]
+async fn atoms_can_be_queried_by_session() {
+    let Some((db, department)) = setup().await else {
+        return;
+    };
+    let store = PostgresMemoryStore::new(Arc::clone(&db));
+    let mut other = atom("a2", "from another session", "alice");
+    other.session_id = Some("s2".into());
+    for a in [atom("a1", "from this session", "alice"), other] {
+        store.upsert(&department, &a, None).await.unwrap();
+    }
+    let filter = AtomFilter {
+        session_id: Some("s1".into()),
+        ..Default::default()
+    };
+    let (found, total) = AtomRepository::query(
+        &store,
+        &department,
+        AtomSelector::Scope(&scope("alice")),
+        &filter,
+        Page {
+            limit: 10,
+            offset: 0,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(total, 1);
+    assert_eq!(found[0].id, "a1");
+    teardown(&db, &department).await;
+}

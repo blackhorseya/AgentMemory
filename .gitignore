@@ -13,3 +13,6 @@
 /upgrade-client-settings.txt
 # Windows download markers (WSL copies them next to each file)
 *:Zone.Identifier
+
+# Local design discussions (not published)
+.discussion/

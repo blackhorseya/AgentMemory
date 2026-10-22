@@ -1597,3 +1597,105 @@ async fn a_tool_refusal_is_dropped_without_retries() {
         .collect();
     assert_eq!(statuses, [json!("dropped")]);
 }
+
+/// Answers L1 like a model that sees the session's earlier atoms: once the
+/// pilot is complete, the new memory supersedes the listed "in progress"
+/// atom, and a second one points at an id that was never listed.
+async fn superseding_l1(Json(req): Json<Value>) -> Json<Value> {
+    let system = req["messages"][0]["content"].as_str().unwrap_or_default();
+    if !system.starts_with("You are a scene-segmentation") {
+        return fake_llm(Json(req)).await;
+    }
+    let input = req["messages"][1]["content"].as_str().unwrap_or_default();
+    let reply = if input.contains("The pilot is complete") {
+        let listed = input
+            .split_once("record_id=")
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .unwrap_or_default();
+        json!([{"scene_name": "I (the AI) am running a pilot with the user", "memories": [
+            {"content": "The pilot was completed on Tuesday", "type": "episodic", "priority": 85,
+             "source_message_ids": [], "supersedes": [listed]},
+            {"content": "The team adopted kebab-case file names", "type": "episodic", "priority": 85,
+             "source_message_ids": [], "supersedes": ["m_not_listed"]}]}])
+    } else {
+        json!([{"scene_name": "I (the AI) am running a pilot with the user", "memories": [
+            {"content": "The pilot is in progress", "type": "episodic", "priority": 85,
+             "source_message_ids": []}]}])
+    };
+    Json(json!({"choices": [{"message": {"role": "assistant", "content": reply.to_string()}}]}))
+}
+
+/// #43: a later turn that finishes what an earlier atom described as under
+/// way revises that atom in place instead of leaving it next to the news.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_later_turn_supersedes_an_out_of_date_atom_of_the_session() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route("/v1/chat/completions", post(superseding_l1)),
+        )
+        .await
+        .unwrap()
+    });
+    let (_data, client) = start_with(|config| {
+        config.llm.base_url = format!("http://{addr}/v1");
+        config.llm.api_key = "fake".into();
+        config.memory.pipeline.every_n_conversations = 1;
+    })
+    .await;
+    let turn = |text: &str| {
+        client.scoped(json!({"session_id": "s1", "messages": [
+            {"role": "user", "content": text},
+            {"role": "assistant", "content": "Noted."}
+        ]}))
+    };
+    let episodic = || async {
+        client
+            .call(
+                "/v3/atomic/query",
+                client.scoped(json!({"type": "episodic"})),
+            )
+            .await["data"]["items"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+
+    let added = client
+        .call("/v3/conversation/add", turn("The pilot is in progress."))
+        .await;
+    assert_eq!(added["code"], 0, "{added}");
+    client
+        .wait_for(|s| s["l1"]["episodic"].as_u64().unwrap_or(0) == 1)
+        .await;
+    let before = episodic().await;
+    let in_progress = before[0]["id"].as_str().unwrap().to_owned();
+
+    let added = client
+        .call("/v3/conversation/add", turn("The pilot is complete."))
+        .await;
+    assert_eq!(added["code"], 0, "{added}");
+    let mut atoms = Vec::new();
+    for _ in 0..100 {
+        atoms = episodic().await;
+        if atoms
+            .iter()
+            .any(|a| a["content"] == "The team adopted kebab-case file names")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(atoms.len(), 2, "{atoms:?}");
+    let revised = atoms
+        .iter()
+        .find(|a| a["id"] == in_progress.as_str())
+        .unwrap_or_else(|| panic!("the in-progress atom is revised in place: {atoms:?}"));
+    assert_eq!(revised["content"], "The pilot was completed on Tuesday");
+    assert_eq!(revised["version"], 2);
+    // An id the model was not shown is ignored: that memory is stored as new.
+    assert!(atoms.iter().any(|a| a["id"] != in_progress.as_str()
+        && a["content"] == "The team adopted kebab-case file names"));
+}

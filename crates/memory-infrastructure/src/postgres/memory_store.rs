@@ -386,6 +386,7 @@ fn atom_where(selector: Option<AtomSelector<'_>>, filter: &AtomFilter) -> Where 
         None => {}
     }
     w.eq_opt("atom_type", filter.atom_type.map(|t| t.as_str().to_owned()));
+    w.eq_opt("session_id", filter.session_id.clone());
     time_where(&mut w, "updated_at_ms", filter.time.start, filter.time.end);
     w
 }

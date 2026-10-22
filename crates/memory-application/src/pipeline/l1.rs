@@ -14,11 +14,16 @@ use tracing::warn;
 
 use super::llm_json::parse_llm_json;
 use super::prompts::{self, CustomStrategy};
+use crate::common::Page;
 use crate::memory::search::AtomSearcher;
-use crate::ports::memory::{AtomFilter, AtomRepository};
+use crate::ports::memory::{AtomFilter, AtomRepository, AtomSelector};
 use crate::ports::system::{ChatMessage, Clock, EmbeddingProvider, IdGenerator, LlmClient};
 
 const DEDUP_CANDIDATES_PER_MEMORY: usize = 5;
+/// The session's newest episodic atoms shown to extraction, so a later turn
+/// can mark one out of date (#43), and the most of their text it may hold.
+const SESSION_ATOMS_SHOWN: usize = 10;
+const SESSION_ATOMS_MAX_CHARS: usize = 3000;
 
 #[derive(Debug, Deserialize)]
 struct SceneBlock {
@@ -38,6 +43,15 @@ struct RawMemory {
     priority: Value,
     #[serde(default)]
     source_message_ids: Vec<String>,
+    /// Ids of the session's atoms this memory makes out of date.
+    #[serde(default)]
+    supersedes: Vec<String>,
+}
+
+/// A new atom, and the atoms it replaces (only ids extraction was shown).
+struct Candidate {
+    atom: AtomicMemory,
+    supersedes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,11 +131,12 @@ impl L1Extractor {
                 llm_called: false,
             });
         }
+        let shown = self.session_atoms(department, scope, session_id).await?;
         let reply = self
             .llm
             .complete(&[
                 ChatMessage::system(&system_prompt),
-                ChatMessage::user(extraction_input(&worth, previous_scene)),
+                ChatMessage::user(extraction_input(&worth, previous_scene, &shown)),
             ])
             .await?;
         let blocks: Vec<SceneBlock> = parse_llm_json(&reply, '[')?;
@@ -131,7 +146,8 @@ impl L1Extractor {
             .map(|b| b.scene_name.trim())
             .find(|s| !s.is_empty())
             .map(Into::into);
-        let candidates = self.to_atoms(scope, session_id, blocks);
+        let shown: HashSet<&str> = shown.iter().map(|a| a.id.as_str()).collect();
+        let candidates = self.to_atoms(scope, session_id, blocks, &shown);
         let written = self
             .reconcile_and_store(department, scope, candidates)
             .await?;
@@ -143,13 +159,40 @@ impl L1Extractor {
         })
     }
 
+    /// The session's newest episodic atoms, within `SESSION_ATOMS_MAX_CHARS`.
+    async fn session_atoms(
+        &self,
+        department: &DepartmentId,
+        scope: &MemoryScope,
+        session_id: &str,
+    ) -> DomainResult<Vec<AtomicMemory>> {
+        let filter = AtomFilter {
+            atom_type: Some(AtomType::Episodic),
+            session_id: Some(session_id.to_owned()),
+            ..Default::default()
+        };
+        let page = Page {
+            limit: SESSION_ATOMS_SHOWN,
+            offset: 0,
+        };
+        let (newest, _) = self
+            .atoms
+            .query(department, AtomSelector::Scope(scope), &filter, page)
+            .await?;
+        Ok(within_budget(newest, SESSION_ATOMS_MAX_CHARS))
+    }
+
     fn to_atoms(
         &self,
         scope: &MemoryScope,
         session_id: &str,
         blocks: Vec<SceneBlock>,
-    ) -> Vec<AtomicMemory> {
+        shown: &HashSet<&str>,
+    ) -> Vec<Candidate> {
         let now = self.clock.now();
+        // An atom is replaced once; a later memory naming it again is stored
+        // as new.
+        let mut claimed: HashSet<String> = HashSet::new();
         blocks
             .into_iter()
             .flat_map(|b| {
@@ -160,39 +203,73 @@ impl L1Extractor {
                 let atom_type = AtomType::parse_lenient(&m.kind)?;
                 let priority = parse_priority(&m.priority);
                 let keep = priority == -1 || priority >= atom_type.min_priority();
-                (keep && !m.content.trim().is_empty()).then(|| AtomicMemory {
-                    id: format!("m_{}_{}", now.timestamp_millis(), self.ids.hex(8)),
-                    scope: scope.clone(),
-                    atom_type,
-                    content: m.content.trim().to_owned(),
-                    background: (!scene.trim().is_empty()).then(|| scene.trim().to_owned()),
-                    priority,
-                    source_message_ids: m.source_message_ids,
-                    session_id: Some(session_id.to_owned()),
-                    version: 1,
-                    created_at: now,
-                    updated_at: now,
-                })
+                (keep && !m.content.trim().is_empty()).then_some((scene, m, atom_type, priority))
             })
             .take(self.max_memories)
+            .map(|(scene, m, atom_type, priority)| {
+                let supersedes = m
+                    .supersedes
+                    .into_iter()
+                    .filter(|id| shown.contains(id.as_str()) && claimed.insert(id.clone()))
+                    .collect();
+                Candidate {
+                    atom: AtomicMemory {
+                        id: format!("m_{}_{}", now.timestamp_millis(), self.ids.hex(8)),
+                        scope: scope.clone(),
+                        atom_type,
+                        content: m.content.trim().to_owned(),
+                        background: (!scene.trim().is_empty()).then(|| scene.trim().to_owned()),
+                        priority,
+                        source_message_ids: m.source_message_ids,
+                        session_id: Some(session_id.to_owned()),
+                        version: 1,
+                        created_at: now,
+                        updated_at: now,
+                    },
+                    supersedes,
+                }
+            })
             .collect()
     }
 
+    /// A memory that supersedes atoms revises them like a dedup `update`;
+    /// the rest go through dedup.
     async fn reconcile_and_store(
         &self,
         department: &DepartmentId,
         scope: &MemoryScope,
-        fresh: Vec<AtomicMemory>,
+        candidates: Vec<Candidate>,
     ) -> DomainResult<Vec<AtomicMemory>> {
+        let mut written = Vec::new();
+        let mut fresh = Vec::new();
+        for c in candidates {
+            if c.supersedes.is_empty() {
+                fresh.push(c.atom);
+                continue;
+            }
+            let update = DedupDecision {
+                record_id: c.atom.id.clone(),
+                action: "update".into(),
+                target_ids: c.supersedes,
+                merged_content: None,
+                merged_type: None,
+                merged_priority: None,
+            };
+            if let Some(revised) = self
+                .merge_into_targets(department, scope, &c.atom, &update)
+                .await?
+            {
+                written.push(revised);
+            }
+        }
         if fresh.is_empty() {
-            return Ok(Vec::new());
+            return Ok(written);
         }
         let decisions = if self.enable_dedup {
             self.dedup(department, scope, &fresh).await
         } else {
             HashMap::new()
         };
-        let mut written = Vec::new();
         for atom in fresh {
             match decisions.get(&atom.id) {
                 Some(d) if d.action == "skip" => {}
@@ -367,11 +444,37 @@ fn parse_priority(v: &Value) -> i32 {
     }
 }
 
-fn extraction_input(messages: &[&ConversationMessage], previous_scene: Option<&str>) -> String {
-    let mut out = format!(
-        "[Previous scene]: {}\n\n[New messages to extract]\n",
-        previous_scene.unwrap_or("none")
-    );
+/// The leading atoms (newest first) whose text fits in `max_chars`.
+fn within_budget(newest: Vec<AtomicMemory>, max_chars: usize) -> Vec<AtomicMemory> {
+    let mut used = 0;
+    newest
+        .into_iter()
+        .take_while(|a| {
+            used += a.content.chars().count();
+            used <= max_chars
+        })
+        .collect()
+}
+
+fn extraction_input(
+    messages: &[&ConversationMessage],
+    previous_scene: Option<&str>,
+    session_atoms: &[AtomicMemory],
+) -> String {
+    let mut out = format!("[Previous scene]: {}\n\n", previous_scene.unwrap_or("none"));
+    if !session_atoms.is_empty() {
+        out.push_str("[Existing memories from this session]\n");
+        for a in session_atoms {
+            out.push_str(&format!(
+                "- record_id={} updated_at={}: {}\n",
+                a.id,
+                a.updated_at.to_rfc3339(),
+                a.content
+            ));
+        }
+        out.push('\n');
+    }
+    out.push_str("[New messages to extract]\n");
     for m in messages {
         let role = match m.role {
             memory_domain::memory::Role::User => "user",
@@ -434,6 +537,47 @@ mod tests {
         assert!(!worth_extracting("..."));
         assert!(worth_extracting("ok"));
         assert!(worth_extracting("我喜歡用 Rust"));
+    }
+
+    fn episodic(id: &str, content: &str) -> AtomicMemory {
+        let now = chrono::Utc::now();
+        AtomicMemory {
+            id: id.into(),
+            scope: MemoryScope::from_optional(None, None, None, None).unwrap(),
+            atom_type: AtomType::Episodic,
+            content: content.into(),
+            background: None,
+            priority: 80,
+            source_message_ids: vec![],
+            session_id: Some("s1".into()),
+            version: 1,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn session_atoms_stop_at_the_character_budget() {
+        let newest = vec![
+            episodic("a", "12345"),
+            episodic("b", "67890"),
+            episodic("c", "x"),
+        ];
+        let ids = |v: Vec<AtomicMemory>| v.into_iter().map(|a| a.id).collect::<Vec<_>>();
+        assert_eq!(ids(within_budget(newest.clone(), 10)), ["a", "b"]);
+        assert_eq!(ids(within_budget(newest.clone(), 4)), Vec::<String>::new());
+        assert_eq!(ids(within_budget(newest, 100)), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn extraction_input_lists_session_atoms_only_when_there_are_some() {
+        assert_eq!(
+            extraction_input(&[], Some("scene"), &[]),
+            "[Previous scene]: scene\n\n[New messages to extract]\n"
+        );
+        let input = extraction_input(&[], None, &[episodic("m_1", "The pilot is in progress")]);
+        assert!(input.contains("[Existing memories from this session]\n- record_id=m_1 "));
+        assert!(input.ends_with(": The pilot is in progress\n\n[New messages to extract]\n"));
     }
 
     #[test]

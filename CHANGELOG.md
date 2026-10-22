@@ -7,6 +7,8 @@ Notable changes of each release. The [release notes](https://github.com/hsuansha
 ## [Unreleased]
 
 ### Changed
+- L1 extraction sees the session's 10 newest episodic memories (up to 3,000 characters). A memory that makes one of them out of date names it in `supersedes`, and that memory is revised in place instead of staying next to the news (#43).
+- L2 writes scene summaries and bodies as the current state rather than a log of the batch's changes, and drops settled open questions (#43).
 - **License: from 0.4.0 the server is licensed under the Business Source License 1.1** instead of MIT. Free for evaluation, personal and non-profit use, and for an organization with up to 1 department and 10 members; larger production use needs a commercial license. Each version becomes Apache 2.0 four years after release. The `amem` client (`crates/memory-client/`) and the plugins (`clients/`) stay MIT, and 0.3.2 and earlier remain MIT. See [COMMERCIAL.md](COMMERCIAL.md).
 
 ## [0.3.2] - 2026-10-21

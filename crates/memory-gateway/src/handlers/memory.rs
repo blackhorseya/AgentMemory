@@ -251,6 +251,7 @@ fn atom_filter(ctx: &Ctx, body: &Value) -> Result<AtomFilter, ApiError> {
         .map_err(|e| ctx.err(e))?;
     Ok(AtomFilter {
         atom_type,
+        session_id: None,
         time: time_range(ctx, body)?,
     })
 }

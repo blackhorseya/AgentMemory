@@ -21,8 +21,14 @@ Extract durable memories of three types:
 Write each memory as one self-contained sentence in the language of the conversation.
 Never invent facts; skip small talk, greetings and transient tool output.
 
+## Task 3 — out-of-date memories of this session
+The input may list [Existing memories from this session], each with a record_id. When the new
+messages show that one of them no longer holds (a plan was finished or dropped, a status or
+decision changed), write a memory with the current state and list the out-of-date record_ids in
+its "supersedes". Use only record_ids from that list. Do not repeat a memory that still holds.
+
 ## Output — JSON only, no prose
-[{"scene_name": "...", "message_ids": ["..."], "memories": [{"content": "...", "type": "persona|episodic|instruction", "priority": 80, "source_message_ids": ["..."], "metadata": {}}]}]
+[{"scene_name": "...", "message_ids": ["..."], "memories": [{"content": "...", "type": "persona|episodic|instruction", "priority": 80, "source_message_ids": ["..."], "supersedes": [], "metadata": {}}]}]
 Return [] when there is nothing worth remembering."#;
 
 pub const L1_DEDUP: &str = r#"You reconcile newly extracted memories with existing ones.
@@ -55,6 +61,8 @@ Heat: new scene = 1, update = old heat + 1, merge = sum of heats + 1.
 ## Evolution
 ## Open questions / contradictions
 
+Write the summary and the body as the scene's current state, not as a log of this batch's changes
+(no "Updates…" or "Adds…"). Drop open questions the memories show are settled.
 If the memories reveal a change that should reshape the long-term persona, set persona_update_request.
 
 ## Output — JSON only

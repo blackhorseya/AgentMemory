@@ -18,6 +18,7 @@ pub struct ConversationFilter {
 #[derive(Debug, Clone, Default)]
 pub struct AtomFilter {
     pub atom_type: Option<AtomType>,
+    pub session_id: Option<String>,
     pub time: TimeRange,
 }
 

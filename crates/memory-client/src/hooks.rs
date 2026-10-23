@@ -696,6 +696,25 @@ mod tests {
     }
 
     #[test]
+    fn a_held_lock_delays_a_writer_by_about_a_second_not_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.json");
+        // Another process stopped while holding the lock.
+        let held = CursorLock::acquire(&path);
+        let (done, finished) = std::sync::mpsc::channel();
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            Cursor::update(writer_path, |state| state["x"] = json!(1));
+            done.send(()).unwrap();
+        });
+        let result = finished.recv_timeout(Duration::from_secs(3));
+        drop(held);
+        writer.join().unwrap();
+        assert!(result.is_ok(), "the writer waited for the lock past 3 s");
+        assert_eq!(Cursor::at(path).state["x"], 1);
+    }
+
+    #[test]
     fn stop_cursor_keys_survive() {
         let mut state = json!({"line": 42, "tail": "t"});
         system_context_due(&mut state, "p", 0);

@@ -116,6 +116,8 @@ impl Cursor {
 }
 
 /// An exclusive `flock` on `<cursor>.lock`, held for one read-change-write.
+/// The lock file lives as long as the cursor; whoever cleans up old session
+/// state removes both.
 /// The cursor itself is replaced by rename on every save, so a lock on it
 /// would be on a file that is already gone. The kernel drops the lock when
 /// the process exits, so a crash leaves nothing to clean up.
@@ -153,18 +155,35 @@ impl CursorLock {
         options.open(path)
     }
 
+    /// How long a hook waits for the lock. A holder only reads and writes
+    /// a small local file; one that has not let go in this time is stopped
+    /// or stuck, and the hook writes without the lock rather than hang.
+    const WAIT: Duration = Duration::from_secs(1);
+
     #[cfg(unix)]
     fn lock(file: &std::fs::File) -> std::io::Result<()> {
+        use std::io::ErrorKind;
         use std::os::unix::io::AsRawFd;
+        let deadline = std::time::Instant::now() + Self::WAIT;
         loop {
             // SAFETY: flock on a descriptor this File owns; it is released
             // when the File is closed.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
                 return Ok(());
             }
             let e = std::io::Error::last_os_error();
-            if e.kind() != std::io::ErrorKind::Interrupted {
-                return Err(e);
+            match e.kind() {
+                ErrorKind::Interrupted => {}
+                ErrorKind::WouldBlock if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                ErrorKind::WouldBlock => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::TimedOut,
+                        format!("held by another process for {:?}", Self::WAIT),
+                    ));
+                }
+                _ => return Err(e),
             }
         }
     }

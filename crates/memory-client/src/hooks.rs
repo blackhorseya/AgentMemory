@@ -107,10 +107,73 @@ impl Cursor {
     /// Every writer of a Claude Code cursor goes through here, so no write
     /// lands between another writer's read and its write.
     fn update<R>(path: PathBuf, change: impl FnOnce(&mut Value) -> R) -> R {
+        let _lock = CursorLock::acquire(&path);
         let mut cursor = Self::at(path);
         let out = change(&mut cursor.state);
         cursor.save();
         out
+    }
+}
+
+/// An exclusive `flock` on `<cursor>.lock`, held for one read-change-write.
+/// The cursor itself is replaced by rename on every save, so a lock on it
+/// would be on a file that is already gone. The kernel drops the lock when
+/// the process exits, so a crash leaves nothing to clean up.
+struct CursorLock(#[allow(dead_code)] Option<std::fs::File>);
+
+impl CursorLock {
+    fn acquire(cursor: &Path) -> Self {
+        let mut path = cursor.as_os_str().to_owned();
+        path.push(".lock");
+        let file = Self::open(Path::new(&path)).and_then(|file| {
+            Self::lock(&file)?;
+            Ok(file)
+        });
+        match file {
+            Ok(file) => Self(Some(file)),
+            Err(e) => {
+                // Better an unlocked write than a hook that fails.
+                log(&format!("cursor lock failed: {e}"));
+                Self(None)
+            }
+        }
+    }
+
+    fn open(path: &Path) -> std::io::Result<std::fs::File> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(false).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options.open(path)
+    }
+
+    #[cfg(unix)]
+    fn lock(file: &std::fs::File) -> std::io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        loop {
+            // SAFETY: flock on a descriptor this File owns; it is released
+            // when the File is closed.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(());
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        }
+    }
+
+    /// Releases ship for Linux and macOS only; elsewhere writes stay
+    /// unlocked, as before.
+    #[cfg(not(unix))]
+    fn lock(_file: &std::fs::File) -> std::io::Result<()> {
+        Ok(())
     }
 }
 

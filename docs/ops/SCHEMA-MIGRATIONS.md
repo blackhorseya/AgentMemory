@@ -43,6 +43,7 @@ flowchart LR
   - SQLite is single-node by design.
 - **Old replicas must be stopped first.** A replica of an earlier version cannot read migrated data. The upgrade guide says so for every release with a migration.
 - **One way only.** There are no down migrations. Going back means restoring the backup `upgrade.sh` takes (see [UPGRADE.md](../UPGRADE.md)).
+- **Newer data is refused.** A store whose version is above the one the code knows (`user_version`, `max(schema_migrations.version)`, `schema_version`) stops memory-core with an error, and nothing is migrated or rewritten. Without this, an older SQLite build would reset `user_version` and a later upgrade would replay migrations over data written in between. Versions up to 0.4.0 do not have the check.
 
 ## 3. Migrations so far
 
@@ -50,6 +51,7 @@ flowchart LR
 | --- | --- | --- |
 | 1 | 0.3.0 | "instance" becomes "department":<br/>• `<data>/instances` → `<data>/departments`<br/>• `system.db` column `instance` → `department`, and the same field inside each document<br/>• Postgres `agent_memory.instances(instance_id)` → `agent_memory.departments(department_id)`<br/>• prompt targets `instance` → `department`<br/>• quota `max_*_per_instance` → `max_*_per_department` (keeping the operator's values)<br/>• Redis `{p}:pipe:inst:*` → `{p}:pipe:department:*`, and the `instance` field of state documents, queued jobs and dead letters |
 | 2 | 0.3.0 | The team role `reviewer` is removed: such members become `member` (SQLite and Postgres; Redis has no step 2) |
+| 3 | next | Scenes and personas become append-only versions: every row of `profile_files` is imported into `scenes` / `scene_versions` / `persona_versions` (version numbers kept, scene ids derived from team, agent and path, persona versions that only refreshed the navigation skipped). `profile_files` is kept but no longer written (SQLite and Postgres; Redis has no step 3) |
 
 ## 4. Adding a migration
 

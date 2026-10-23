@@ -43,6 +43,7 @@ flowchart LR
   - SQLite 本來就只支援單一節點。
 - **必須先停掉舊版的 replica。** 舊版讀不懂遷移後的資料。每個含遷移的版本，升級指南都會寫明這點。
 - **只能往前。** 沒有反向遷移。要回到舊版，請還原 `upgrade.sh` 做的備份（見 [UPGRADE.zh-tw.md](../UPGRADE.zh-tw.md)）。
+- **拒絕更新的資料。** 儲存端的版本（`user_version`、`max(schema_migrations.version)`、`schema_version`）比程式認得的新時，memory-core 會停止並顯示錯誤，不遷移也不改寫任何東西。沒有這項檢查的話，舊的 SQLite 版本會把 `user_version` 改回去，之後再升級時會在中間寫入的資料上重跑遷移。0.4.0 以前的版本沒有這項檢查。
 
 ## 3. 目前的遷移
 
@@ -50,6 +51,7 @@ flowchart LR
 | --- | --- | --- |
 | 1 | 0.3.0 | 「instance」改名為「部門（department）」：<br/>• `<data>/instances` → `<data>/departments`<br/>• `system.db` 的欄位 `instance` → `department`，各文件裡的同名欄位也一起改<br/>• Postgres 的 `agent_memory.instances(instance_id)` → `agent_memory.departments(department_id)`<br/>• prompt 目標 `instance` → `department`<br/>• 配額 `max_*_per_instance` → `max_*_per_department`（保留維運人員設定的值）<br/>• Redis 的 `{p}:pipe:inst:*` → `{p}:pipe:department:*`，以及狀態文件、佇列中的 job 和 dead letter 裡的 `instance` 欄位 |
 | 2 | 0.3.0 | 移除 team 角色 `reviewer`：這些成員改為 `member`（SQLite 和 Postgres；Redis 沒有第 2 步） |
+| 3 | 下一版 | 場景和 persona 改成只追加的版本：`profile_files` 的每一列都匯入 `scenes`／`scene_versions`／`persona_versions`（保留版本號；場景 id 由 team、agent 和路徑推導；只更新了導覽的 persona 版本略過）。`profile_files` 保留但不再寫入（SQLite 和 Postgres；Redis 沒有第 3 步） |
 
 ## 4. 新增遷移
 

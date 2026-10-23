@@ -5,9 +5,9 @@
 //! pipeline cursors, which point at `seq`, resume exactly where they
 //! stopped. Derived data is rebuilt instead of copied: keyword tokens
 //! become `tsvector`s, and the sqlite-vec index gives way to the `embedding`
-//! column. Files under the data directory (L2/L3 objects, skill resources)
-//! and the local coordination state are shared by both backends and stay
-//! where they are.
+//! column. Files under the data directory (raw session turns, skill
+//! resources) and the local coordination state are shared by both backends
+//! and stay where they are.
 //!
 //! The source must not change while this runs: stop memory-core first.
 //! Each department is copied in one transaction and checked by row count
@@ -142,6 +142,44 @@ const TABLES: &[Table] = &[
             ("is_head", Bool),
             ("created_at_ms", Int),
             ("updated_at_ms", Int),
+        ],
+    ),
+    table(
+        "scenes",
+        &[
+            ("id", Text),
+            ("team_id", Text),
+            ("agent_id", Text),
+            ("created_at_ms", Int),
+        ],
+    ),
+    table(
+        "scene_versions",
+        &[
+            ("scene_id", Text),
+            ("version", Int),
+            ("op", Text),
+            ("slug", Text),
+            ("summary", Text),
+            ("heat", Int),
+            ("body", Text),
+            ("attrs", Json),
+            ("parents", Json),
+            ("author", Text),
+            ("created_at_ms", Int),
+        ],
+    ),
+    table(
+        "persona_versions",
+        &[
+            ("team_id", Text),
+            ("agent_id", Text),
+            ("version", Int),
+            ("op", Text),
+            ("body", Text),
+            ("attrs", Json),
+            ("author", Text),
+            ("created_at_ms", Int),
         ],
     ),
     table(

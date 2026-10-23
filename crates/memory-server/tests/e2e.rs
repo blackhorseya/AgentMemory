@@ -15,6 +15,25 @@ const L1_REPLY: &str = r###"[{"scene_name":"I (the AI) am planning a release wit
   {"content":"The user always runs integration tests before a release","type":"persona","priority":80,"source_message_ids":[]},
   {"content":"low value chatter","type":"persona","priority":10,"source_message_ids":[]}]}]"###;
 const L2_REPLY: &str = r###"{"operations":[{"action":"create","file":"Release Planning","summary":"How the user ships releases","content":"## Core narrative\nRuns integration tests, then releases on Monday."}],"persona_update_request":null}"###;
+/// L2's answer when a scene named `Legacy-Release.md` already exists.
+const L2_MERGE_REPLY: &str = r###"{"operations":[{"action":"merge","file":"Release Planning","merge_from":["Legacy-Release.md"],"summary":"How the user ships releases","content":"## Core narrative\nRuns integration tests, then releases on Monday."}],"persona_update_request":null}"###;
+/// L2's answer while the user changes scenes under it (see `RACE`): a
+/// create whose name the user takes, an update of a scene the user edits,
+/// and a create nobody touches.
+const L2_RACE_REPLY: &str = r###"{"operations":[{"action":"create","file":"Raced","summary":"from L2","content":"Raced, from L2"},{"action":"update","file":"Race-Seed","summary":"from L2","content":"Race seed, from L2"},{"action":"create","file":"Calm","summary":"from L2","content":"Calm, from L2"}],"persona_update_request":null}"###;
+
+/// Scene writes the fake LLM makes as the user while L2 waits for its
+/// answer: (core URL, department, user key, team, agent, writes).
+type RaceWrites = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Vec<(&'static str, &'static str)>,
+);
+static RACE: std::sync::Mutex<Option<RaceWrites>> = std::sync::Mutex::new(None);
+
 const L3_REPLY: &str =
     "```markdown\n# User Narrative Profile\n> **Archetype**: careful shipper\n```";
 const SKILL_REPLY: &str = r###"{"actions":[{"action":"create","name":"release-checklist","content":"---\nname: release-checklist\ndescription: Checklist before shipping a release\n---\n1. Run integration tests\n2. Tag and release"}],"summary":"saved release checklist"}"###;
@@ -27,7 +46,28 @@ async fn fake_llm(Json(req): Json<Value>) -> Json<Value> {
     } else if system.starts_with("You reconcile") {
         "[]"
     } else if system.starts_with("You are a Memory Consolidation") {
-        L2_REPLY
+        let input = req["messages"][1]["content"].as_str().unwrap_or_default();
+        if input.contains("### Legacy-Release.md") {
+            L2_MERGE_REPLY
+        } else if input.contains("### Race-Seed.md") {
+            let race = RACE.lock().unwrap().take();
+            if let Some((base, department, key, team, agent, writes)) = race {
+                let http = reqwest::Client::new();
+                for (path, content) in writes {
+                    http.post(format!("{base}/v3/scenario/write"))
+                        .bearer_auth("test-key")
+                        .header("x-memory-department-id", &department)
+                        .header("x-memory-user-key", &key)
+                        .json(&json!({"team_id": team, "agent_id": agent, "path": path, "content": content}))
+                        .send()
+                        .await
+                        .unwrap();
+                }
+            }
+            L2_RACE_REPLY
+        } else {
+            L2_REPLY
+        }
     } else if system.starts_with("You are a Persona Architect") {
         L3_REPLY
     } else if system.starts_with("You review a finished agent conversation") {
@@ -278,6 +318,182 @@ async fn the_pipeline_runs_on_the_postgres_backend() {
             json!({"department_id": client.department}),
         )
         .await;
+}
+
+/// Scenes are append-only: rewrites, merges and removals add versions, and
+/// every earlier version stays readable.
+#[tokio::test(flavor = "multi_thread")]
+async fn scene_versions_survive_merges_and_removals() {
+    let (_data, client) = start().await;
+    let write = |content: &'static str| {
+        client.call(
+            "/v3/scenario/write",
+            client.scoped(
+                json!({"path": "Legacy-Release.md", "content": content, "summary": "old notes"}),
+            ),
+        )
+    };
+    assert_eq!(write("first draft").await["data"]["version"], 1);
+    assert_eq!(write("second draft").await["data"]["version"], 2);
+    let read = |path: &'static str, version: Option<u32>| {
+        client.call(
+            "/v3/scenario/read",
+            client.scoped(json!({"path": path, "version": version})),
+        )
+    };
+    let first = read("Legacy-Release.md", Some(1)).await;
+    assert!(
+        first["data"]["content"]
+            .as_str()
+            .unwrap()
+            .ends_with("first draft"),
+        "{first}"
+    );
+
+    // L2 merges the legacy scene into a new one.
+    client
+        .call(
+            "/v3/conversation/add",
+            client.scoped(json!({"session_id": "s1", "messages": [
+                {"role": "user", "content": "We release v2 next Monday; I always run integration tests first."},
+                {"role": "assistant", "content": "Noted, I will remind you."}
+            ]})),
+        )
+        .await;
+    client
+        .wait_for(|s| s["l1"]["total"] == 2 && s["generation_logs"].as_u64().unwrap_or(0) >= 2)
+        .await;
+    let scenes = client
+        .call("/v3/scenario/ls", client.scoped(json!({})))
+        .await;
+    let entries = scenes["data"]["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "{scenes}");
+    assert_eq!(entries[0]["path"], "Release-Planning.md");
+    assert_eq!(entries[0]["heat"], 2, "the merge adds the absorbed heat");
+
+    let merged_away = read("Legacy-Release.md", None).await;
+    assert!(merged_away["data"]["content"].is_null(), "{merged_away}");
+    let kept = read("Legacy-Release.md", Some(2)).await;
+    assert!(
+        kept["data"]["content"]
+            .as_str()
+            .unwrap()
+            .ends_with("second draft"),
+        "{kept}"
+    );
+
+    // Removing retires the scene; its versions stay.
+    let removed = client
+        .call(
+            "/v3/scenario/rm",
+            client.scoped(json!({"path": "Release-Planning.md"})),
+        )
+        .await;
+    assert_eq!(removed["data"]["removed"], 1, "{removed}");
+    let scenes = client
+        .call("/v3/scenario/ls", client.scoped(json!({})))
+        .await;
+    assert_eq!(scenes["data"]["total"], 0, "{scenes}");
+    let old = read("Release-Planning.md", Some(1)).await;
+    assert!(
+        old["data"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Core narrative"),
+        "{old}"
+    );
+    let old_id = old["data"]["scene_id"].as_str().unwrap().to_owned();
+
+    // A new scene takes the name; the old one stays reachable by id.
+    let taken = client
+        .call(
+            "/v3/scenario/write",
+            client.scoped(json!({"path": "Release-Planning.md", "content": "a fresh start"})),
+        )
+        .await;
+    assert_ne!(taken["data"]["scene_id"], json!(old_id), "{taken}");
+    let by_name = read("Release-Planning.md", Some(1)).await;
+    assert!(
+        by_name["data"]["content"]
+            .as_str()
+            .unwrap()
+            .ends_with("a fresh start"),
+        "{by_name}"
+    );
+    let by_id = client
+        .call(
+            "/v3/scenario/read",
+            client.scoped(json!({"scene_id": old_id, "version": 1})),
+        )
+        .await;
+    assert!(
+        by_id["data"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Core narrative"),
+        "{by_id}"
+    );
+    assert_eq!(by_id["data"]["op"], "merge", "{by_id}");
+    assert_eq!(
+        by_id["data"]["parents"].as_array().unwrap().len(),
+        1,
+        "{by_id}"
+    );
+}
+
+/// The user's writes made while L2 runs win: L2 drops what it planned from
+/// the older snapshot, and a dropped create does not use up the batch's one
+/// new scene.
+#[tokio::test(flavor = "multi_thread")]
+async fn scene_writes_during_l2_are_kept() {
+    let (_data, client) = start().await;
+    let seeded = client
+        .call(
+            "/v3/scenario/write",
+            client.scoped(json!({"path": "Race-Seed.md", "content": "seed"})),
+        )
+        .await;
+    assert_eq!(seeded["data"]["version"], 1, "{seeded}");
+    *RACE.lock().unwrap() = Some((
+        client.base.clone(),
+        client.department.clone(),
+        client.member_key.clone(),
+        client.team_id.clone(),
+        client.agent_id.clone(),
+        vec![
+            ("Raced.md", "Raced, by the user"),
+            ("Race-Seed.md", "Race seed, edited by the user"),
+        ],
+    ));
+    client
+        .call(
+            "/v3/conversation/add",
+            client.scoped(json!({"session_id": "s1", "messages": [
+                {"role": "user", "content": "We release v2 next Monday; I always run integration tests first."},
+                {"role": "assistant", "content": "Noted, I will remind you."}
+            ]})),
+        )
+        .await;
+    client
+        .wait_for(|s| s["l2"] == 3 && s["generation_logs"].as_u64().unwrap_or(0) >= 2)
+        .await;
+    let read =
+        |path: &'static str| client.call("/v3/scenario/read", client.scoped(json!({"path": path})));
+    for (path, by) in [
+        ("Raced.md", "Raced, by the user"),
+        ("Race-Seed.md", "Race seed, edited by the user"),
+        ("Calm.md", "Calm, from L2"),
+    ] {
+        let scene = read(path).await;
+        let content = scene["data"]["content"].as_str().unwrap_or_default();
+        assert!(content.ends_with(by), "{path}: {scene}");
+    }
+    let seed = read("Race-Seed.md").await;
+    assert_eq!(
+        (seed["data"]["version"].clone(), seed["data"]["op"].clone()),
+        (json!(2), json!("manual")),
+        "{seed}"
+    );
 }
 
 async fn assert_conversation_is_distilled(client: &Client) {
